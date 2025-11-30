@@ -1,0 +1,66 @@
+# Foundry 配置文件
+# FlashArb-Core 智能合约
+
+[profile.default]
+# 源文件目录
+src = "contracts"
+
+# 测试目录
+test = "test"
+
+# 输出目录
+out = "out"
+
+# 库目录
+libs = ["lib"]
+
+# Solidity 版本
+solc_version = "0.8.19"
+
+# 优化设置
+optimizer = true
+optimizer_runs = 10000  # 高运行次数，因为合约会频繁调用
+
+# EVM 版本
+evm_version = "paris"
+
+# Gas 报告
+gas_reports = ["FlashBot"]
+
+# 模糊测试配置
+[fuzz]
+runs = 1000
+max_test_rejects = 65536
+
+# 不变量测试配置
+[invariant]
+runs = 256
+depth = 32
+
+# 格式化配置
+[fmt]
+line_length = 100
+tab_width = 4
+bracket_spacing = true
+int_types = "long"
+multiline_func_header = "params_first"
+quote_style = "double"
+number_underscore = "thousands"
+
+# RPC 端点配置（从环境变量加载）
+[rpc_endpoints]
+mainnet = "${ETH_RPC_URL}"
+base = "${BASE_RPC_URL}"
+bsc = "${BSC_RPC_URL}"
+arbitrum = "${ARBITRUM_RPC_URL}"
+polygon = "${POLYGON_RPC_URL}"
+
+# Etherscan 验证配置
+[etherscan]
+mainnet = { key = "${ETHERSCAN_API_KEY}" }
+base = { key = "${BASESCAN_API_KEY}", url = "https://api.basescan.org/api" }
+bsc = { key = "${BSCSCAN_API_KEY}", url = "https://api.bscscan.com/api" }
+arbitrum = { key = "${ARBISCAN_API_KEY}", url = "https://api.arbiscan.io/api" }
+polygon = { key = "${POLYGONSCAN_API_KEY}", url = "https://api.polygonscan.com/api" }
+
+
