@@ -75,6 +75,12 @@ class ExecutionResult:
     gas_price: int = 0
     error: Optional[str] = None
     profit_realized: int = 0
+    # 性能统计（毫秒）
+    time_simulation_ms: float = 0.0
+    time_signing_ms: float = 0.0
+    time_broadcast_ms: float = 0.0
+    time_confirmation_ms: float = 0.0
+    time_total_ms: float = 0.0
 
 
 @dataclass
@@ -429,6 +435,7 @@ class ArbitrageExecutor:
             
             # 6. 预执行模拟（Pre-Execution Simulation）
             # 使用 eth_call 模拟交易，避免发送会失败的交易
+            t_sim_start = time.time()
             try:
                 # 构建调用参数（移除 nonce，call 不需要）
                 call_params = {
@@ -453,6 +460,8 @@ class ArbitrageExecutor:
                 # 重置 nonce 缓存，因为交易未发送，nonce 未被消耗
                 self._reset_nonce()
                 error_msg = str(sim_error)
+                t_sim_end = time.time()
+                time_sim_ms = (t_sim_end - t_sim_start) * 1000
                 
                 return ExecutionResult(
                     success=False,
@@ -460,22 +469,35 @@ class ArbitrageExecutor:
                     gas_used=0,
                     gas_price=gas_params.get("gasPrice", gas_params.get("maxFeePerGas", 0)),
                     error=f"Simulation failed: {error_msg}",
-                    profit_realized=0
+                    profit_realized=0,
+                    time_simulation_ms=time_sim_ms,
+                    time_total_ms=(t_sim_end - start_time) * 1000
                 )
+            t_sim_end = time.time()
+            time_sim_ms = (t_sim_end - t_sim_start) * 1000
             
             # 7. 签名交易
+            t_sign_start = time.time()
             signed_tx = self.account.sign_transaction(tx)
+            t_sign_end = time.time()
+            time_sign_ms = (t_sign_end - t_sign_start) * 1000
             
             # 8. 发送交易
             # Web3.py v6+ 使用 raw_transaction (snake_case)
+            t_broadcast_start = time.time()
             tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
             tx_hash_hex = tx_hash.hex()
+            t_broadcast_end = time.time()
+            time_broadcast_ms = (t_broadcast_end - t_broadcast_start) * 1000
             
             # 9. 等待确认
+            t_confirm_start = time.time()
             receipt = self.w3.eth.wait_for_transaction_receipt(
                 tx_hash, 
                 timeout=TX_TIMEOUT
             )
+            t_confirm_end = time.time()
+            time_confirm_ms = (t_confirm_end - t_confirm_start) * 1000
             
             # 10. 检查结果
             tx_status = receipt["status"] == 1
@@ -501,7 +523,8 @@ class ArbitrageExecutor:
             else:
                 self.failed_count += 1
             
-            elapsed = time.time() - start_time
+            # 计算总耗时
+            time_total_ms = (time.time() - start_time) * 1000
             
             return ExecutionResult(
                 success=success,
@@ -509,7 +532,12 @@ class ArbitrageExecutor:
                 gas_used=gas_used,
                 gas_price=gas_params.get("gasPrice", gas_params.get("maxFeePerGas", 0)),
                 profit_realized=expected_profit if success else 0,
-                error=error_msg
+                error=error_msg,
+                time_simulation_ms=time_sim_ms,
+                time_signing_ms=time_sign_ms,
+                time_broadcast_ms=time_broadcast_ms,
+                time_confirmation_ms=time_confirm_ms,
+                time_total_ms=time_total_ms
             )
             
         except Exception as e:

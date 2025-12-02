@@ -465,12 +465,19 @@ class FlashArbBot:
         """
         self.scan_count += 1
         
+        # 性能统计：记录扫描开始时间 (t0)
+        t0_scan_start = time.time()
+        
         # DEBUG: 显示扫描开始
         if DEBUG_MODE:
             logger.debug("🔄 Scanning market...")
         
         # 1. 扫描机会
         opportunities = self.scanner.run_once()
+        
+        # 性能统计：记录机会发现时间 (t1)
+        t1_opportunity_found = time.time()
+        scan_time_ms = (t1_opportunity_found - t0_scan_start) * 1000
         
         # DEBUG: 显示每个配对的价格信息
         if DEBUG_MODE:
@@ -637,6 +644,15 @@ class FlashArbBot:
                 logger.info(f"  Tx Hash: {result.tx_hash}")
                 logger.info(f"  Gas 使用: {result.gas_used:,}")
                 
+                # 打印性能统计
+                logger.info(f"  ⏱️ Speed Stats:")
+                logger.info(f"     - Scan:         {scan_time_ms:.0f}ms")
+                logger.info(f"     - Simulation:   {result.time_simulation_ms:.0f}ms")
+                logger.info(f"     - Signing:      {result.time_signing_ms:.0f}ms")
+                logger.info(f"     - Broadcast:    {result.time_broadcast_ms:.0f}ms")
+                logger.info(f"     - Confirmation: {result.time_confirmation_ms:.0f}ms")
+                logger.info(f"     - Total Exec:   {result.time_total_ms:.0f}ms")
+                
                 # 成功交易：从冷却列表中移除并重置失败计数
                 token_key = token_address.lower()
                 if token_key in self.failed_opportunities:
@@ -662,13 +678,28 @@ class FlashArbBot:
                 
                 if is_simulation_failure:
                     # 模拟失败：交易未发送，节省了 gas
-                    logger.warning(f"  ⚠️ [SIMULATION] 模拟失败，跳过交易以节省 gas: {result.error}")
+                    logger.warning(f"  ⚠️ [SIMULATION] 模拟失败，跳过交易以节省 gas")
+                    logger.warning(f"     Error: {result.error}")
+                    logger.info(f"  ⏱️ Speed Stats (Simulation Failed):")
+                    logger.info(f"     - Scan:       {scan_time_ms:.0f}ms")
+                    logger.info(f"     - Simulation: {result.time_simulation_ms:.0f}ms (failed)")
+                    logger.info(f"     - Total:      {result.time_total_ms:.0f}ms")
                 elif is_soft_fail:
                     # 软失败：交易成功但没有执行套利（early exit）
-                    logger.warning(f"  ⚠️ [SOFT FAIL] 交易未执行套利 (gas={result.gas_used}): {result.error}")
+                    logger.warning(f"  ⚠️ [SOFT FAIL] 交易未执行套利 (gas={result.gas_used})")
+                    logger.info(f"  ⏱️ Speed Stats (Soft Fail):")
+                    logger.info(f"     - Scan:         {scan_time_ms:.0f}ms")
+                    logger.info(f"     - Simulation:   {result.time_simulation_ms:.0f}ms")
+                    logger.info(f"     - Signing:      {result.time_signing_ms:.0f}ms")
+                    logger.info(f"     - Broadcast:    {result.time_broadcast_ms:.0f}ms")
+                    logger.info(f"     - Confirmation: {result.time_confirmation_ms:.0f}ms")
+                    logger.info(f"     - Total Exec:   {result.time_total_ms:.0f}ms")
                 else:
                     # 链上 revert：交易已发送但失败
                     logger.warning(f"  ❌ 交易失败 (链上 revert): {result.error}")
+                    logger.info(f"  ⏱️ Speed Stats (Revert):")
+                    logger.info(f"     - Scan:         {scan_time_ms:.0f}ms")
+                    logger.info(f"     - Total Exec:   {result.time_total_ms:.0f}ms")
                 
                 # 递进式冷却：失败次数越多，冷却时间越长
                 token_key = token_address.lower()
