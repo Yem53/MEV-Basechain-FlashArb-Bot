@@ -468,10 +468,7 @@ class ArbitrageExecutor:
             
             # 8. 发送交易
             # Web3.py v6+ 使用 raw_transaction (snake_case)
-            raw_tx = getattr(signed_tx, 'raw_transaction', None) or getattr(signed_tx, 'rawTransaction', None)
-            if raw_tx is None:
-                raise ValueError("无法获取原始交易数据")
-            tx_hash = self.w3.eth.send_raw_transaction(raw_tx)
+            tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
             tx_hash_hex = tx_hash.hex()
             
             # 9. 等待确认
