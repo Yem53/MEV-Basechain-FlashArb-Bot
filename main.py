@@ -28,6 +28,7 @@ import json
 import signal
 import asyncio
 import logging
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime
@@ -77,6 +78,9 @@ SCAN_INTERVAL = float(os.getenv("SCAN_INTERVAL", "0.5"))  # 秒
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 GAS_PRICE_GWEI = float(os.getenv("GAS_PRICE_GWEI", "0.01"))
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"  # 详细日志模式
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "60"))  # 失败后冷却时间（秒）
+MAX_FAIL_COUNT = int(os.getenv("MAX_FAIL_COUNT", "3"))  # 最大失败次数，超过后长时间冷却
+LONG_COOLDOWN_SECONDS = int(os.getenv("LONG_COOLDOWN_SECONDS", "3600"))  # 长冷却时间（1小时）
 
 # ==========================================
 # 🎯 Base Mainnet Target Tokens (Verified)
@@ -92,10 +96,22 @@ USDbC_ADDRESS = "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA"  # 桥接 USDC
 # 蓝筹 Meme 币 - 高波动性、价差大、Renounced ownership、0% Tax
 TARGET_TOKENS = [
     {
+        "symbol": "KEYCAT",
+        "address": "0x9a26F5433671751C3276a065f57e5a02D2817973",
+        "decimals": 18,
+        "min_profit": 0.0003, # 约 $1.00
+    },
+    {
+        "symbol": "HIGHER",
+        "address": "0x0578d8A44db98B23BF096A382e016e29a5Ce0ffe",
+        "decimals": 18,
+        "min_profit": 0.0003,
+    },
+    {
         "symbol": "BRETT",
         "address": "0x532f27101965dd16442E59d40670FaF5eBB142E4",
         "decimals": 18,
-        "min_profit": 0.0003,  # Approx $1.00 (Covers Gas + Profit)
+        "min_profit": 0.0003,
     },
     {
         "symbol": "TOSHI",
@@ -104,17 +120,11 @@ TARGET_TOKENS = [
         "min_profit": 0.0003,
     },
     {
-        "symbol": "DEGEN",
-        "address": "0x4ed4E862860beD51a9570b96d8014731D394fF0d",
-        "decimals": 18,
-        "min_profit": 0.0003,
-    },
-    {
         "symbol": "AERO",
         "address": "0x940181a94A35A4569E4529A3CDfB74e38FD98631",
         "decimals": 18,
         "min_profit": 0.0003,
-    },
+    }
 ]
 
 # 创建代币符号映射（地址 -> 符号）
@@ -220,6 +230,13 @@ class FlashArbBot:
         self.scan_interval = SCAN_INTERVAL
         self.dry_run = DRY_RUN
         self.gas_price_gwei = GAS_PRICE_GWEI
+        self.cooldown_seconds = COOLDOWN_SECONDS
+        self.max_fail_count = MAX_FAIL_COUNT
+        self.long_cooldown_seconds = LONG_COOLDOWN_SECONDS
+        
+        # 冷却机制：记录失败的机会
+        # {token_address: {"timestamp": float, "count": int, "cooldown": int}}
+        self.failed_opportunities: Dict[str, Dict] = {}
     
     def initialize(self) -> bool:
         """
@@ -546,6 +563,36 @@ class FlashArbBot:
             if net_profit < self.min_profit_threshold:
                 continue
             
+            # 获取代币地址（用于冷却检查）
+            token_address = self._get_token_address(opp)
+            token_symbol = self._get_token_symbol(opp)
+            
+            # 检查冷却期
+            current_time = time.time()
+            token_key = token_address.lower()
+            if token_key in self.failed_opportunities:
+                fail_info = self.failed_opportunities[token_key]
+                failed_time = fail_info["timestamp"]
+                fail_count = fail_info["count"]
+                cooldown_duration = fail_info["cooldown"]
+                elapsed = current_time - failed_time
+                
+                if elapsed < cooldown_duration:
+                    remaining = cooldown_duration - elapsed
+                    # 格式化剩余时间
+                    if remaining >= 3600:
+                        time_str = f"{remaining/3600:.1f} 小时"
+                    elif remaining >= 60:
+                        time_str = f"{remaining/60:.1f} 分钟"
+                    else:
+                        time_str = f"{remaining:.0f} 秒"
+                    logger.debug(f"[COOLDOWN] 跳过 {token_symbol}（失败 {fail_count} 次），还需等待 {time_str}")
+                    continue
+                else:
+                    # 冷却期已过，但保留失败次数记录（不删除）
+                    # 只有成功交易才会重置失败次数
+                    logger.info(f"[COOLDOWN] {token_symbol} 冷却期结束（已失败 {fail_count} 次），重新尝试")
+            
             # 3. 发现有利可图的机会！
             profit_eth = net_profit / 10**18
             borrow_eth = opp.borrow_amount / 10**18
@@ -557,9 +604,6 @@ class FlashArbBot:
             logger.info(f"  借入: {borrow_eth:.4f} ETH")
             logger.info(f"  预期利润: {profit_eth:.6f} ETH (${profit_eth * 3000:.2f})")
             logger.info(f"  价格差异: {opp.price_diff_bps:.2f} bps")
-            
-            # 获取代币符号（用于日志）
-            token_symbol = self._get_token_symbol(opp)
             
             # 4. 执行交易
             if self.dry_run:
@@ -575,7 +619,15 @@ class FlashArbBot:
                 continue
             
             # 确定交易参数
-            result = await self._execute_opportunity(opp)
+            try:
+                result = await self._execute_opportunity(opp)
+            except Exception as e:
+                # 捕获执行过程中的异常（如 AttributeError）
+                logger.error(f"  ❌ 执行异常: {e}")
+                result = ExecutionResult(
+                    success=False,
+                    error=str(e)
+                )
             
             # 记录到交易日志
             if result.success:
@@ -584,6 +636,13 @@ class FlashArbBot:
                 logger.info(f"  ✅ 交易成功!")
                 logger.info(f"  Tx Hash: {result.tx_hash}")
                 logger.info(f"  Gas 使用: {result.gas_used:,}")
+                
+                # 成功交易：从冷却列表中移除并重置失败计数
+                token_key = token_address.lower()
+                if token_key in self.failed_opportunities:
+                    prev_count = self.failed_opportunities[token_key]["count"]
+                    del self.failed_opportunities[token_key]
+                    logger.info(f"  ✅ {token_symbol} 失败计数已重置（之前失败 {prev_count} 次）")
                 
                 # 记录成功交易
                 self.journal.log_trade(
@@ -597,16 +656,63 @@ class FlashArbBot:
                     actual_profit=result.profit_realized / 10**18 if result.profit_realized else 0
                 )
             else:
-                logger.warning(f"  ❌ 交易失败: {result.error}")
+                # 交易失败：可能是模拟失败、链上 revert 或软失败
+                is_simulation_failure = result.tx_hash is None
+                is_soft_fail = result.error and "Soft fail" in result.error
+                
+                if is_simulation_failure:
+                    # 模拟失败：交易未发送，节省了 gas
+                    logger.warning(f"  ⚠️ [SIMULATION] 模拟失败，跳过交易以节省 gas: {result.error}")
+                elif is_soft_fail:
+                    # 软失败：交易成功但没有执行套利（early exit）
+                    logger.warning(f"  ⚠️ [SOFT FAIL] 交易未执行套利 (gas={result.gas_used}): {result.error}")
+                else:
+                    # 链上 revert：交易已发送但失败
+                    logger.warning(f"  ❌ 交易失败 (链上 revert): {result.error}")
+                
+                # 递进式冷却：失败次数越多，冷却时间越长
+                token_key = token_address.lower()
+                if token_key in self.failed_opportunities:
+                    # 已有失败记录，增加计数
+                    prev_count = self.failed_opportunities[token_key]["count"]
+                    new_count = prev_count + 1
+                else:
+                    new_count = 1
+                
+                # 根据失败次数决定冷却时间
+                if new_count >= self.max_fail_count:
+                    # 达到最大失败次数，长时间冷却
+                    cooldown = self.long_cooldown_seconds
+                    cooldown_str = f"{cooldown/3600:.1f} 小时"
+                    logger.warning(f"  🚫 {token_symbol} 已失败 {new_count} 次，进入长冷却期 ({cooldown_str})")
+                else:
+                    # 普通冷却
+                    cooldown = self.cooldown_seconds
+                    cooldown_str = f"{cooldown} 秒"
+                    logger.info(f"  ⏳ [COOLDOWN] {token_symbol} 失败 {new_count}/{self.max_fail_count} 次，冷却 {cooldown_str}")
+                
+                # 更新冷却列表
+                self.failed_opportunities[token_key] = {
+                    "timestamp": current_time,
+                    "count": new_count,
+                    "cooldown": cooldown
+                }
                 
                 # 记录失败交易
+                if is_simulation_failure:
+                    status = "Simulation Failed"
+                elif is_soft_fail:
+                    status = "Soft Fail"
+                else:
+                    status = "Revert"
+                    
                 self.journal.log_trade(
                     token_symbol=token_symbol,
                     borrow_amount=borrow_eth,
                     direction=opp.direction,
                     expected_profit=profit_eth,
-                    tx_hash=result.tx_hash or "N/A",
-                    status="Revert",
+                    tx_hash=result.tx_hash or "N/A (Simulation)",
+                    status=status,
                     notes=result.error or ""
                 )
             
@@ -699,6 +805,31 @@ class FlashArbBot:
         
         return result
     
+    def _get_token_address(self, opp: ArbitrageOpportunity) -> str:
+        """
+        从套利机会中获取代币地址（非 WETH）
+        
+        参数：
+            opp: 套利机会对象
+            
+        返回：
+            代币地址
+        """
+        weth_lower = WETH_ADDRESS.lower()
+        
+        if opp.pair_a.token0.lower() != weth_lower:
+            return opp.pair_a.token0
+        elif opp.pair_a.token1.lower() != weth_lower:
+            return opp.pair_a.token1
+        else:
+            # 回退到 pair_b
+            if opp.pair_b.token0.lower() != weth_lower:
+                return opp.pair_b.token0
+            elif opp.pair_b.token1.lower() != weth_lower:
+                return opp.pair_b.token1
+        
+        return ""
+    
     def _get_token_symbol(self, opp: ArbitrageOpportunity) -> str:
         """
         从套利机会中获取代币符号
@@ -710,21 +841,14 @@ class FlashArbBot:
             代币符号（如 "BRETT"）
         """
         # 获取非 WETH 的代币地址
-        weth_lower = WETH_ADDRESS.lower()
-        
-        if opp.pair_a.token0.lower() != weth_lower:
-            other_token = opp.pair_a.token0
-        elif opp.pair_a.token1.lower() != weth_lower:
-            other_token = opp.pair_a.token1
-        else:
-            other_token = ""
+        token_address = self._get_token_address(opp)
         
         # 从 TOKEN_SYMBOLS 映射获取符号
-        symbol = TOKEN_SYMBOLS.get(other_token.lower(), "")
+        symbol = TOKEN_SYMBOLS.get(token_address.lower(), "")
         
         if not symbol:
             # 如果映射中没有，返回地址的缩写
-            symbol = other_token[:8] + "..." if other_token else "UNKNOWN"
+            symbol = token_address[:8] + "..." if token_address else "UNKNOWN"
         
         return symbol
     

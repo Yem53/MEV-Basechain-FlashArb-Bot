@@ -272,10 +272,13 @@ class TradeJournal:
             "total_trades": 0,
             "successful": 0,
             "reverted": 0,
+            "soft_fail": 0,
+            "simulation_failed": 0,
             "pending": 0,
             "dry_run": 0,
             "total_profit_eth": 0.0,
-            "total_gas_used": 0
+            "total_gas_used": 0,
+            "total_gas_wasted": 0  # 失败交易浪费的 gas
         }
         
         with self._lock:
@@ -285,6 +288,13 @@ class TradeJournal:
                 for row in reader:
                     stats["total_trades"] += 1
                     status = row.get("Status", "").lower()
+                    gas_used = 0
+                    
+                    try:
+                        gas_used = int(row.get("Gas_Used") or 0)
+                        stats["total_gas_used"] += gas_used
+                    except ValueError:
+                        pass
                     
                     if status == "success":
                         stats["successful"] += 1
@@ -294,15 +304,17 @@ class TradeJournal:
                             pass
                     elif status == "revert":
                         stats["reverted"] += 1
+                        stats["total_gas_wasted"] += gas_used
+                    elif status == "soft fail":
+                        stats["soft_fail"] += 1
+                        stats["total_gas_wasted"] += gas_used
+                    elif status == "simulation failed":
+                        stats["simulation_failed"] += 1
+                        # 模拟失败不消耗 gas
                     elif status == "pending":
                         stats["pending"] += 1
                     elif status == "dryrun":
                         stats["dry_run"] += 1
-                    
-                    try:
-                        stats["total_gas_used"] += int(row.get("Gas_Used") or 0)
-                    except ValueError:
-                        pass
         
         return stats
     
@@ -310,17 +322,31 @@ class TradeJournal:
         """打印交易摘要"""
         stats = self.get_stats()
         
+        # 计算失败总数
+        total_failed = stats['reverted'] + stats['soft_fail'] + stats['simulation_failed']
+        
         print("\n" + "=" * 50)
         print("📊 Trade Journal Summary")
         print("=" * 50)
-        print(f"  Total Trades:    {stats['total_trades']}")
-        print(f"  Successful:      {stats['successful']}")
-        print(f"  Reverted:        {stats['reverted']}")
-        print(f"  Pending:         {stats['pending']}")
-        print(f"  Dry Run:         {stats['dry_run']}")
-        print(f"  Total Profit:    {stats['total_profit_eth']:.6f} ETH")
-        print(f"  Total Gas Used:  {stats['total_gas_used']:,}")
-        print(f"  Log File:        {self.file_path}")
+        print(f"  Total Trades:       {stats['total_trades']}")
+        print(f"  ✅ Successful:      {stats['successful']}")
+        print(f"  ❌ Failed:          {total_failed}")
+        if stats['reverted'] > 0:
+            print(f"     - Reverted:      {stats['reverted']}")
+        if stats['soft_fail'] > 0:
+            print(f"     - Soft Fail:     {stats['soft_fail']}")
+        if stats['simulation_failed'] > 0:
+            print(f"     - Sim Failed:    {stats['simulation_failed']}")
+        if stats['pending'] > 0:
+            print(f"  ⏳ Pending:         {stats['pending']}")
+        if stats['dry_run'] > 0:
+            print(f"  🔍 Dry Run:         {stats['dry_run']}")
+        print("-" * 50)
+        print(f"  💰 Total Profit:    {stats['total_profit_eth']:.6f} ETH")
+        print(f"  ⛽ Total Gas Used:  {stats['total_gas_used']:,}")
+        if stats['total_gas_wasted'] > 0:
+            print(f"  🔥 Gas Wasted:      {stats['total_gas_wasted']:,}")
+        print(f"  📁 Log File:        {self.file_path}")
         print("=" * 50 + "\n")
 
 

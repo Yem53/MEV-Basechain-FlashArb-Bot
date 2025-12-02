@@ -48,6 +48,11 @@ TX_TIMEOUT = 60
 # Nonce 重试次数
 MAX_NONCE_RETRIES = 3
 
+# 最小 Gas 消耗阈值（用于检测软失败）
+# 真正的套利交易通常消耗 >100k gas
+# 软失败（early exit）通常只消耗 ~30k gas
+MIN_GAS_FOR_SUCCESS = 80000
+
 # Aerodrome Router 地址 (Base Mainnet)
 AERODROME_ROUTER = "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43"
 
@@ -422,22 +427,74 @@ class ArbitrageExecutor:
                     error="Dry run - 未实际发送"
                 )
             
-            # 6. 签名交易
+            # 6. 预执行模拟（Pre-Execution Simulation）
+            # 使用 eth_call 模拟交易，避免发送会失败的交易
+            try:
+                # 构建调用参数（移除 nonce，call 不需要）
+                call_params = {
+                    "from": self.address,
+                    "gas": self.gas_limit,
+                    **gas_params
+                }
+                
+                # 模拟交易执行
+                self.contract.functions.startArbitrage(
+                    token_borrow,
+                    borrow_amount,
+                    pair_address,
+                    user_data
+                ).call(call_params)
+                
+                # 模拟成功，继续执行
+                
+            except Exception as sim_error:
+                # 模拟失败（交易会 revert）
+                # 注意：不增加 tx_count，因为交易未实际发送，节省了 gas
+                # 重置 nonce 缓存，因为交易未发送，nonce 未被消耗
+                self._reset_nonce()
+                error_msg = str(sim_error)
+                
+                return ExecutionResult(
+                    success=False,
+                    tx_hash=None,
+                    gas_used=0,
+                    gas_price=gas_params.get("gasPrice", gas_params.get("maxFeePerGas", 0)),
+                    error=f"Simulation failed: {error_msg}",
+                    profit_realized=0
+                )
+            
+            # 7. 签名交易
             signed_tx = self.account.sign_transaction(tx)
             
-            # 7. 发送交易
-            tx_hash = self.w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            # 8. 发送交易
+            # Web3.py v6+ 使用 raw_transaction (snake_case)
+            raw_tx = getattr(signed_tx, 'raw_transaction', None) or getattr(signed_tx, 'rawTransaction', None)
+            if raw_tx is None:
+                raise ValueError("无法获取原始交易数据")
+            tx_hash = self.w3.eth.send_raw_transaction(raw_tx)
             tx_hash_hex = tx_hash.hex()
             
-            # 8. 等待确认
+            # 9. 等待确认
             receipt = self.w3.eth.wait_for_transaction_receipt(
                 tx_hash, 
                 timeout=TX_TIMEOUT
             )
             
-            # 9. 检查结果
-            success = receipt["status"] == 1
+            # 10. 检查结果
+            tx_status = receipt["status"] == 1
             gas_used = receipt["gasUsed"]
+            
+            # 检测软失败：交易状态成功但 gas 消耗过低
+            # 真正的套利交易消耗 >100k gas，软失败只消耗 ~30k
+            is_soft_fail = tx_status and gas_used < MIN_GAS_FOR_SUCCESS
+            
+            if is_soft_fail:
+                # 软失败：合约内部提前退出，没有执行真正的套利
+                success = False
+                error_msg = f"Soft fail detected: only {gas_used} gas used (expected >{MIN_GAS_FOR_SUCCESS})"
+            else:
+                success = tx_status
+                error_msg = None if success else "Transaction reverted"
             
             # 更新统计
             self.tx_count += 1
@@ -455,7 +512,7 @@ class ArbitrageExecutor:
                 gas_used=gas_used,
                 gas_price=gas_params.get("gasPrice", gas_params.get("maxFeePerGas", 0)),
                 profit_realized=expected_profit if success else 0,
-                error=None if success else "Transaction reverted"
+                error=error_msg
             )
             
         except Exception as e:
