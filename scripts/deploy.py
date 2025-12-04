@@ -89,15 +89,43 @@ def compile_contract() -> Dict[str, Any]:
     if not main_contract.exists():
         raise FileNotFoundError(f"Contract not found: {main_contract}")
     
-    # Read all source files
+    # Read all source files with correct import path mapping
     sources = {}
     
-    def read_sources(path: Path, base_path: Path):
-        for file in path.rglob("*.sol"):
-            rel_path = file.relative_to(base_path)
-            sources[str(rel_path)] = {"content": file.read_text(encoding="utf-8")}
+    # Read main contract
+    sources["FlashBotV3.sol"] = {"content": main_contract.read_text(encoding="utf-8")}
     
-    read_sources(contracts_dir, contracts_dir)
+    # Read interfaces - use key matching import path
+    interfaces_dir = contracts_dir / "interfaces"
+    if interfaces_dir.exists():
+        for file in interfaces_dir.glob("*.sol"):
+            # Key must match import: "./interfaces/..." -> "interfaces/..."
+            key = f"interfaces/{file.name}"
+            sources[key] = {"content": file.read_text(encoding="utf-8")}
+    
+    # Read libraries  
+    libraries_dir = contracts_dir / "libraries"
+    if libraries_dir.exists():
+        for file in libraries_dir.glob("*.sol"):
+            key = f"libraries/{file.name}"
+            sources[key] = {"content": file.read_text(encoding="utf-8")}
+    
+    print(f"   Found {len(sources)} source files:")
+    for src in sources.keys():
+        print(f"     - {src}")
+    
+    # Fix import paths in source code for solcx compatibility
+    # solcx expects imports without "./" prefix
+    def fix_imports(content: str) -> str:
+        content = content.replace('import "./interfaces/', 'import "interfaces/')
+        content = content.replace('import "./libraries/', 'import "libraries/')
+        content = content.replace('import "../interfaces/', 'import "interfaces/')
+        content = content.replace('import "../libraries/', 'import "libraries/')
+        return content
+    
+    # Apply fixes to all sources
+    for key in sources:
+        sources[key]["content"] = fix_imports(sources[key]["content"])
     
     # Compile
     compiled = solcx.compile_standard({
@@ -109,7 +137,7 @@ def compile_contract() -> Dict[str, Any]:
                 "*": {"*": ["abi", "evm.bytecode.object"]}
             }
         }
-    }, allow_paths=[str(contracts_dir)])
+    })
     
     # Extract FlashBotV3
     contract_data = compiled["contracts"]["FlashBotV3.sol"]["FlashBotV3"]
