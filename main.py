@@ -50,7 +50,9 @@ from core.calculator import (
 )
 from core.scanner import (
     ArbitrageScanner, 
-    ArbitrageOpportunity, 
+    ArbitrageOpportunity,
+    ScanResult,
+    ShadowOpportunity,
     HARDCODED_PAIRS,
     DEX_CONFIG,
     discover_all_pairs,
@@ -82,6 +84,18 @@ COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "60"))  # 失败后冷却�
 MAX_FAIL_COUNT = int(os.getenv("MAX_FAIL_COUNT", "3"))  # 最大失败次数，超过后长时间冷却
 LONG_COOLDOWN_SECONDS = int(os.getenv("LONG_COOLDOWN_SECONDS", "3600"))  # 长冷却时间（1小时）
 
+# ============================================
+# 🔍 Shadow Mode 配置
+# ============================================
+# Shadow Mode: 记录价差好但利润为负的机会，用于诊断
+SHADOW_SPREAD_THRESHOLD = float(os.getenv("SHADOW_SPREAD_THRESHOLD", "0.005"))  # 0.5%
+SHADOW_MODE_ENABLED = os.getenv("SHADOW_MODE", "true").lower() == "true"
+
+# ============================================
+# ⏱️ 延迟分析配置
+# ============================================
+LATENCY_PROFILING_ENABLED = os.getenv("LATENCY_PROFILING", "true").lower() == "true"
+
 # ==========================================
 # 🎯 Base Mainnet Target Tokens (Verified)
 # ==========================================
@@ -97,33 +111,36 @@ USDbC_ADDRESS = "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA"  # 桥接 USDC
 TARGET_TOKENS = [
     {
         "symbol": "KEYCAT",
+        # 你的扫描结果提供的地址
         "address": "0x9a26F5433671751C3276a065f57e5a02D2817973",
         "decimals": 18,
-        "min_profit": 0.0003, # 约 $1.00
+        "min_profit": 0.0002, # 约 $0.7, 这种高价差币种，稍微降低门槛确保命中
     },
     {
-        "symbol": "HIGHER",
-        "address": "0x0578d8A44db98B23BF096A382e016e29a5Ce0ffe",
+        "symbol": "SKI",
+        # 你的扫描结果提供的地址
+        "address": "0x768BE13e1680b5ebE0024C42c896E3dB59ec0149",
         "decimals": 18,
-        "min_profit": 0.0003,
+        "min_profit": 0.0002,
+    },
+    {
+        "symbol": "VIRTUAL",
+        # 你的扫描结果提供的地址
+        "address": "0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b",
+        "decimals": 18,
+        "min_profit": 0.0002,
     },
     {
         "symbol": "BRETT",
         "address": "0x532f27101965dd16442E59d40670FaF5eBB142E4",
         "decimals": 18,
-        "min_profit": 0.0003,
+        "min_profit": 0.0002,
     },
     {
         "symbol": "TOSHI",
         "address": "0xAC1Bd2486aAf3B5C0fc3Fd868558b082a531B2B4",
         "decimals": 18,
-        "min_profit": 0.0003,
-    },
-    {
-        "symbol": "AERO",
-        "address": "0x940181a94A35A4569E4529A3CDfB74e38FD98631",
-        "decimals": 18,
-        "min_profit": 0.0003,
+        "min_profit": 0.0002,
     }
 ]
 
@@ -234,6 +251,13 @@ class FlashArbBot:
         self.max_fail_count = MAX_FAIL_COUNT
         self.long_cooldown_seconds = LONG_COOLDOWN_SECONDS
         
+        # 🔍 Shadow Mode 配置
+        self.shadow_spread_threshold = SHADOW_SPREAD_THRESHOLD
+        self.shadow_mode_enabled = SHADOW_MODE_ENABLED
+        
+        # ⏱️ 延迟分析配置
+        self.latency_profiling_enabled = LATENCY_PROFILING_ENABLED
+        
         # 冷却机制：记录失败的机会
         # {token_address: {"timestamp": float, "count": int, "cooldown": int}}
         self.failed_opportunities: Dict[str, Dict] = {}
@@ -340,6 +364,9 @@ class FlashArbBot:
         logger.info(f"  Gas 价格: {self.gas_price_gwei} Gwei")
         logger.info(f"  Dry Run 模式: {self.dry_run}")
         logger.info(f"  Debug 模式: {DEBUG_MODE}")
+        logger.info(f"  🔍 Shadow Mode: {self.shadow_mode_enabled} (阈值: {self.shadow_spread_threshold*100:.1f}%)")
+        logger.info(f"  ⏱️ 延迟分析: {self.latency_profiling_enabled}")
+        logger.info(f"  🎯 Sniper Mode: 启用 (优先费 +20%)")
         logger.info("-" * 60)
         
         return True
@@ -462,22 +489,32 @@ class FlashArbBot:
     async def _scan_and_execute(self):
         """
         扫描并执行套利
+        
+        🚀 Super-Batch Multicall: 单次请求获取所有储备
+        🔍 Shadow Mode: 诊断被拒绝的机会
+        ⏱️ End-to-End Latency Profiling
         """
         self.scan_count += 1
         
-        # 性能统计：记录扫描开始时间 (t0)
-        t0_scan_start = time.time()
+        # ⏱️ 性能统计：记录扫描开始时间 (t_start)
+        t_start = time.time()
         
         # DEBUG: 显示扫描开始
         if DEBUG_MODE:
-            logger.debug("🔄 Scanning market...")
+            logger.debug("🔄 Scanning market (Super-Batch Multicall)...")
         
-        # 1. 扫描机会
-        opportunities = self.scanner.run_once()
+        # 🚀 1. 使用 Super-Batch Multicall 扫描机会
+        scan_result: ScanResult = self.scanner.scan(
+            shadow_spread_threshold=self.shadow_spread_threshold
+        )
+        opportunities = scan_result.opportunities
         
-        # 性能统计：记录机会发现时间 (t1)
-        t1_opportunity_found = time.time()
-        scan_time_ms = (t1_opportunity_found - t0_scan_start) * 1000
+        # ⏱️ 延迟分析：网络时间
+        t_network = scan_result.time_network_ms
+        t_calc = scan_result.time_calc_ms
+        
+        # 🔍 Shadow Mode: 获取被拒绝的机会
+        shadow_opportunities = self.scanner.get_last_shadow_opportunities()
         
         # DEBUG: 显示每个配对的价格信息
         if DEBUG_MODE:
@@ -554,7 +591,22 @@ class FlashArbBot:
                     status = "✅" if net_profit_pct > 0 else "❌"
                     logger.debug(f"  📉 {symbol} Spread: {diff_pct:.3f}% | Profit: {net_profit_eth:.4f} ETH {status}")
         
-        # 2. 处理每个机会
+        # 🔍 2. Shadow Mode: 记录被拒绝的机会
+        if self.shadow_mode_enabled and shadow_opportunities and not opportunities:
+            for shadow in shadow_opportunities[:3]:  # 只显示前3个
+                logger.warning(f"[SHADOW] {shadow.direction}")
+                logger.warning(f"  Spread is good ({shadow.spread_percent:.3f}%), but Profit is negative ({shadow.expected_profit_wei / 10**18:.6f} ETH)")
+                logger.warning(f"  Breakdown: Gas Cost = {shadow.gas_cost_wei / 10**18:.6f} ETH, "
+                             f"Slippage Loss = {shadow.slippage_loss_wei / 10**18:.6f} ETH, "
+                             f"DEX Fee = {shadow.dex_fee_wei / 10**18:.6f} ETH")
+                logger.warning(f"  Reason: {shadow.rejection_reason}")
+            
+            # ⏱️ 延迟分析（Shadow Mode）
+            if self.latency_profiling_enabled:
+                t_total = (time.time() - t_start) * 1000
+                logger.info(f"⏱️ LATENCY: Network: {t_network:.0f}ms | Calc: {t_calc:.0f}ms | Total: {t_total:.0f}ms")
+        
+        # 3. 处理每个机会
         if DEBUG_MODE and not opportunities:
             logger.debug("  ⚠️ Scanner 未发现可执行的套利机会")
             logger.debug("     (注意: DEBUG 估算使用简化公式，Scanner 使用精确 AMM 计算)")
@@ -644,14 +696,18 @@ class FlashArbBot:
                 logger.info(f"  Tx Hash: {result.tx_hash}")
                 logger.info(f"  Gas 使用: {result.gas_used:,}")
                 
-                # 打印性能统计
-                logger.info(f"  ⏱️ Speed Stats:")
-                logger.info(f"     - Scan:         {scan_time_ms:.0f}ms")
-                logger.info(f"     - Simulation:   {result.time_simulation_ms:.0f}ms")
-                logger.info(f"     - Signing:      {result.time_signing_ms:.0f}ms")
-                logger.info(f"     - Broadcast:    {result.time_broadcast_ms:.0f}ms")
-                logger.info(f"     - Confirmation: {result.time_confirmation_ms:.0f}ms")
-                logger.info(f"     - Total Exec:   {result.time_total_ms:.0f}ms")
+                # ⏱️ End-to-End Latency Profiling
+                if self.latency_profiling_enabled:
+                    t_total = t_network + t_calc + result.time_total_ms
+                    logger.info(f"  ⏱️ LATENCY: Network: {t_network:.0f}ms | Calc: {t_calc:.0f}ms | Exec: {result.time_simulation_ms + result.time_signing_ms:.0f}ms | Broadcast: {result.time_broadcast_ms:.0f}ms | Total: {t_total:.0f}ms")
+                    logger.info(f"  ⏱️ Speed Stats (Detailed):")
+                    logger.info(f"     - Network (Multicall): {t_network:.0f}ms")
+                    logger.info(f"     - Calculation:         {t_calc:.0f}ms")
+                    logger.info(f"     - Simulation:          {result.time_simulation_ms:.0f}ms")
+                    logger.info(f"     - Signing:             {result.time_signing_ms:.0f}ms")
+                    logger.info(f"     - Broadcast:           {result.time_broadcast_ms:.0f}ms")
+                    logger.info(f"     - Confirmation:        {result.time_confirmation_ms:.0f}ms")
+                    logger.info(f"     - Total:               {t_total:.0f}ms")
                 
                 # 成功交易：从冷却列表中移除并重置失败计数
                 token_key = token_address.lower()
@@ -680,26 +736,21 @@ class FlashArbBot:
                     # 模拟失败：交易未发送，节省了 gas
                     logger.warning(f"  ⚠️ [SIMULATION] 模拟失败，跳过交易以节省 gas")
                     logger.warning(f"     Error: {result.error}")
-                    logger.info(f"  ⏱️ Speed Stats (Simulation Failed):")
-                    logger.info(f"     - Scan:       {scan_time_ms:.0f}ms")
-                    logger.info(f"     - Simulation: {result.time_simulation_ms:.0f}ms (failed)")
-                    logger.info(f"     - Total:      {result.time_total_ms:.0f}ms")
+                    if self.latency_profiling_enabled:
+                        t_total = t_network + t_calc + result.time_total_ms
+                        logger.info(f"  ⏱️ LATENCY: Network: {t_network:.0f}ms | Calc: {t_calc:.0f}ms | Sim: {result.time_simulation_ms:.0f}ms (failed) | Total: {t_total:.0f}ms")
                 elif is_soft_fail:
                     # 软失败：交易成功但没有执行套利（early exit）
                     logger.warning(f"  ⚠️ [SOFT FAIL] 交易未执行套利 (gas={result.gas_used})")
-                    logger.info(f"  ⏱️ Speed Stats (Soft Fail):")
-                    logger.info(f"     - Scan:         {scan_time_ms:.0f}ms")
-                    logger.info(f"     - Simulation:   {result.time_simulation_ms:.0f}ms")
-                    logger.info(f"     - Signing:      {result.time_signing_ms:.0f}ms")
-                    logger.info(f"     - Broadcast:    {result.time_broadcast_ms:.0f}ms")
-                    logger.info(f"     - Confirmation: {result.time_confirmation_ms:.0f}ms")
-                    logger.info(f"     - Total Exec:   {result.time_total_ms:.0f}ms")
+                    if self.latency_profiling_enabled:
+                        t_total = t_network + t_calc + result.time_total_ms
+                        logger.info(f"  ⏱️ LATENCY: Network: {t_network:.0f}ms | Calc: {t_calc:.0f}ms | Exec: {result.time_simulation_ms + result.time_signing_ms:.0f}ms | Broadcast: {result.time_broadcast_ms:.0f}ms | Total: {t_total:.0f}ms")
                 else:
                     # 链上 revert：交易已发送但失败
                     logger.warning(f"  ❌ 交易失败 (链上 revert): {result.error}")
-                    logger.info(f"  ⏱️ Speed Stats (Revert):")
-                    logger.info(f"     - Scan:         {scan_time_ms:.0f}ms")
-                    logger.info(f"     - Total Exec:   {result.time_total_ms:.0f}ms")
+                    if self.latency_profiling_enabled:
+                        t_total = t_network + t_calc + result.time_total_ms
+                        logger.info(f"  ⏱️ LATENCY: Network: {t_network:.0f}ms | Calc: {t_calc:.0f}ms | Total Exec: {result.time_total_ms:.0f}ms | Total: {t_total:.0f}ms")
                 
                 # 递进式冷却：失败次数越多，冷却时间越长
                 token_key = token_address.lower()

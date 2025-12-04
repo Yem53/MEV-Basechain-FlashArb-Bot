@@ -174,11 +174,14 @@ class ArbitrageExecutor:
             self._pending_nonce = None
             self._last_nonce_fetch = 0
     
-    def _get_gas_params(self) -> Dict[str, int]:
+    def _get_gas_params(self, sniper_mode: bool = True) -> Dict[str, int]:
         """
-        获取 Gas 参数
+        获取 Gas 参数 (支持 Sniper Mode)
         
         自动检测是否支持 EIP-1559
+        
+        参数：
+            sniper_mode: 是否启用 Sniper Mode（增加 20% 优先费以确保快速打包）
         """
         try:
             # 尝试获取最新区块的 baseFee（EIP-1559）
@@ -187,8 +190,26 @@ class ArbitrageExecutor:
             
             if base_fee is not None:
                 # EIP-1559 模式
-                # maxPriorityFeePerGas: 小费（通常 0.01-0.1 Gwei）
-                priority_fee = self.w3.to_wei(0.01, "gwei")
+                # 🎯 Sniper Mode: 从链上获取真实的 maxPriorityFeePerGas 并提升 20%
+                try:
+                    # 获取网络建议的优先费
+                    suggested_priority_fee = self.w3.eth.max_priority_fee
+                    
+                    if sniper_mode:
+                        # Sniper Mode: 增加 20% tip boost 以抢占区块位置
+                        priority_fee = int(suggested_priority_fee * 1.2)
+                    else:
+                        priority_fee = suggested_priority_fee
+                    
+                    # 确保优先费至少为 0.01 Gwei
+                    min_priority_fee = self.w3.to_wei(0.01, "gwei")
+                    priority_fee = max(priority_fee, min_priority_fee)
+                    
+                except Exception:
+                    # 如果获取失败，使用默认值
+                    priority_fee = self.w3.to_wei(0.01, "gwei")
+                    if sniper_mode:
+                        priority_fee = int(priority_fee * 1.2)
                 
                 # maxFeePerGas: base_fee * 2 + priority_fee
                 max_fee = base_fee * 2 + priority_fee
@@ -205,6 +226,11 @@ class ArbitrageExecutor:
             else:
                 # Legacy 模式
                 gas_price = self.w3.eth.gas_price
+                
+                if sniper_mode:
+                    # Sniper Mode: 增加 20% gas price
+                    gas_price = int(gas_price * 1.2)
+                
                 max_allowed = self.w3.to_wei(self.max_gas_price_gwei, "gwei")
                 
                 if gas_price > max_allowed:
@@ -214,7 +240,10 @@ class ArbitrageExecutor:
                 
         except Exception:
             # 回退到 Legacy 模式
-            return {"gasPrice": self.w3.to_wei(0.01, "gwei")}
+            gas_price = self.w3.to_wei(0.01, "gwei")
+            if sniper_mode:
+                gas_price = int(gas_price * 1.2)
+            return {"gasPrice": gas_price}
     
     def _encode_user_data(
         self,
@@ -482,15 +511,51 @@ class ArbitrageExecutor:
             t_sign_end = time.time()
             time_sign_ms = (t_sign_end - t_sign_start) * 1000
             
-            # 8. 发送交易
-            # Web3.py v6+ 使用 raw_transaction (snake_case)
+            # --- 8. 鲁棒地获取原始交易字节 (兼容不同 Web3.py 版本) ---
+            raw_tx_bytes = None
+            
+            # 尝试 camelCase (Web3.py v5 和大多数 v6)
+            if hasattr(signed_tx, 'rawTransaction'):
+                raw_tx_bytes = signed_tx.rawTransaction
+            # 尝试 snake_case (某些特定 v6 版本)
+            elif hasattr(signed_tx, 'raw_transaction'):
+                raw_tx_bytes = signed_tx.raw_transaction
+            # 回退：字典访问
+            elif isinstance(signed_tx, dict) and 'rawTransaction' in signed_tx:
+                raw_tx_bytes = signed_tx['rawTransaction']
+            elif isinstance(signed_tx, dict) and 'raw_transaction' in signed_tx:
+                raw_tx_bytes = signed_tx['raw_transaction']
+            
+            if raw_tx_bytes is None:
+                # 最后尝试：检查对象的所有属性
+                for attr in dir(signed_tx):
+                    if 'raw' in attr.lower() and 'transaction' in attr.lower():
+                        raw_tx_bytes = getattr(signed_tx, attr, None)
+                        if raw_tx_bytes:
+                            break
+            
+            if raw_tx_bytes is None:
+                self._reset_nonce()
+                return ExecutionResult(
+                    success=False,
+                    tx_hash=None,
+                    gas_used=0,
+                    gas_price=gas_params.get("gasPrice", gas_params.get("maxFeePerGas", 0)),
+                    error=f"Could not extract raw bytes from SignedTransaction. Available attrs: {[a for a in dir(signed_tx) if not a.startswith('_')]}",
+                    profit_realized=0,
+                    time_simulation_ms=time_sim_ms,
+                    time_signing_ms=time_sign_ms,
+                    time_total_ms=(time.time() - start_time) * 1000
+                )
+            
+            # 9. 发送交易 (使用安全提取的原始字节)
             t_broadcast_start = time.time()
-            tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            tx_hash = self.w3.eth.send_raw_transaction(raw_tx_bytes)
             tx_hash_hex = tx_hash.hex()
             t_broadcast_end = time.time()
             time_broadcast_ms = (t_broadcast_end - t_broadcast_start) * 1000
             
-            # 9. 等待确认
+            # 10. 等待确认
             t_confirm_start = time.time()
             receipt = self.w3.eth.wait_for_transaction_receipt(
                 tx_hash, 
@@ -499,7 +564,7 @@ class ArbitrageExecutor:
             t_confirm_end = time.time()
             time_confirm_ms = (t_confirm_end - t_confirm_start) * 1000
             
-            # 10. 检查结果
+            # 11. 检查结果
             tx_status = receipt["status"] == 1
             gas_used = receipt["gasUsed"]
             

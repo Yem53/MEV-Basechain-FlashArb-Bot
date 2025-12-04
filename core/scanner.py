@@ -4,9 +4,10 @@
 
 功能：
 - 监控多个 DEX 上的配对价格
-- 使用 Multicall 批量获取储备数据
+- 使用 Super-Batch Multicall 在单次请求中获取所有储备数据
 - 计算套利机会并输出结果
 - 支持持续监控模式
+- 支持延迟性能分析
 
 支持的 DEX（Base Mainnet）：
 - BaseSwap: Factory 0xFDa619b6d20975be80A10332cD39b9a4b0FAa8BB
@@ -19,7 +20,7 @@
     
     或在代码中：
     scanner = ArbitrageScanner(w3)
-    scanner.run_once()  # 单次扫描
+    result = scanner.scan()  # 返回 ScanResult 包含机会和延迟信息
     scanner.run_loop(interval=1.0)  # 持续监控
 """
 
@@ -28,7 +29,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, NamedTuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from web3 import Web3
 
 # 添加项目根目录到路径
@@ -186,6 +187,11 @@ class ArbitrageOpportunity:
     profit_after_gas: int
     price_diff_bps: float
     timestamp: float
+    # Shadow Mode 诊断信息
+    spread_percent: float = 0.0     # 价差百分比
+    gas_cost_wei: int = 0           # Gas 成本
+    slippage_loss_wei: int = 0      # 滑点损失
+    dex_fee_wei: int = 0            # DEX 手续费
 
 
 class PairGroup(NamedTuple):
@@ -193,6 +199,61 @@ class PairGroup(NamedTuple):
     token0: str
     token1: str
     pairs: List[PairInfo]
+
+
+@dataclass
+class ScanResult:
+    """
+    扫描结果（包含延迟性能分析）
+    
+    用于 End-to-End Latency Profiling
+    """
+    opportunities: List[ArbitrageOpportunity] = field(default_factory=list)
+    # 延迟指标（毫秒）
+    time_network_ms: float = 0.0      # Multicall 网络请求时间
+    time_calc_ms: float = 0.0         # 套利计算时间
+    time_total_ms: float = 0.0        # 总扫描时间
+    # 统计信息
+    pairs_scanned: int = 0            # 扫描的配对数
+    pairs_with_data: int = 0          # 成功获取数据的配对数
+    
+    def get_latency_str(self) -> str:
+        """获取格式化的延迟字符串"""
+        return f"Network: {self.time_network_ms:.0f}ms | Calc: {self.time_calc_ms:.0f}ms | Total: {self.time_total_ms:.0f}ms"
+
+
+@dataclass
+class ShadowOpportunity:
+    """
+    Shadow Mode 机会
+    
+    记录被拒绝但有潜在价值的套利机会，用于诊断
+    """
+    pair_a: PairInfo
+    pair_b: PairInfo
+    direction: str
+    spread_percent: float       # 价差百分比
+    expected_profit_wei: int    # 预期利润（负数表示亏损）
+    gas_cost_wei: int           # Gas 成本
+    slippage_loss_wei: int      # 滑点损失估算
+    dex_fee_wei: int            # DEX 手续费
+    rejection_reason: str       # 拒绝原因
+    timestamp: float
+    
+    def get_breakdown_str(self) -> str:
+        """获取成本分解字符串"""
+        profit_eth = self.expected_profit_wei / 10**18
+        gas_eth = self.gas_cost_wei / 10**18
+        slippage_eth = self.slippage_loss_wei / 10**18
+        fee_eth = self.dex_fee_wei / 10**18
+        
+        return (
+            f"Spread: {self.spread_percent:.3f}% | "
+            f"Profit: {profit_eth:.6f} ETH | "
+            f"Gas: {gas_eth:.6f} ETH | "
+            f"Slippage: {slippage_eth:.6f} ETH | "
+            f"DEX Fee: {fee_eth:.6f} ETH"
+        )
 
 
 # ============================================
@@ -315,28 +376,36 @@ class ArbitrageScanner:
             for tokens, pairs in groups.items()
         }
     
-    def update_reserves(self) -> bool:
+    def update_reserves(self) -> Tuple[bool, float, int]:
         """
-        批量更新所有配对的储备数据
+        批量更新所有配对的储备数据（Super-Batch Multicall）
         
         安全机制：
         - 使用 Multicall 批量获取，减少 RPC 调用
         - 单个配对失败不影响其他配对的更新
         - 失败的配对保留上次的储备数据
         
+        🚀 Super-Batch 优化:
+        - 所有配对在单次 Multicall 请求中获取
+        - 每个扫描周期只有 1 个网络请求
+        
         返回：
-            是否至少成功更新一个配对
+            (是否成功, 网络请求耗时ms, 成功更新的配对数)
         """
         pair_addresses = [p.address for p in self.pairs.values()]
         
         if not pair_addresses:
-            return False
+            return False, 0.0, 0
         
         success_count = 0
         failed_dexes = []
         
         try:
+            # 🚀 Super-Batch: 单次 Multicall 获取所有储备
+            t_network_start = time.time()
             reserves_list = self.multicall.get_reserves_batch(pair_addresses)
+            t_network_end = time.time()
+            network_time_ms = (t_network_end - t_network_start) * 1000
             
             now = time.time()
             for addr, reserves in zip(pair_addresses, reserves_list):
@@ -360,14 +429,17 @@ class ArbitrageScanner:
             if success_count == 0 and failed_dexes:
                 print(f"[WARN] 储备更新全部失败")
             
-            return success_count > 0
+            return success_count > 0, network_time_ms, success_count
             
         except Exception as e:
             # Multicall 整体失败
             print(f"[WARN] Multicall 失败: {e}")
-            return False
+            return False, 0.0, 0
     
-    def find_opportunities(self) -> List[ArbitrageOpportunity]:
+    def find_opportunities(
+        self, 
+        shadow_spread_threshold: float = 0.005
+    ) -> Tuple[List[ArbitrageOpportunity], List[ShadowOpportunity]]:
         """
         在所有配对组中寻找套利机会
         
@@ -375,10 +447,18 @@ class ArbitrageScanner:
         1. 最小流动性检查 - 跳过 WETH < 0.5 ETH 的池
         2. 健壮错误处理 - 单个 DEX 失败不影响其他扫描
         
+        Shadow Mode:
+        - 记录价差超过阈值但利润为负的机会
+        - 用于诊断为什么交易没有执行
+        
+        参数：
+            shadow_spread_threshold: Shadow Mode 价差阈值（默认 0.5%）
+        
         返回：
-            套利机会列表
+            (套利机会列表, Shadow 机会列表)
         """
         opportunities = []
+        shadow_opportunities = []
         gas_cost = estimate_gas_cost(self.gas_price_gwei, FLASH_SWAP_GAS)
         
         for tokens, group in self.pair_groups.items():
@@ -419,16 +499,21 @@ class ArbitrageScanner:
                             continue
                         
                         # 检查两个方向的套利机会
-                        opp = self._check_pair_opportunity(pair_a, pair_b, gas_cost)
+                        opp, shadow = self._check_pair_opportunity_with_shadow(
+                            pair_a, pair_b, gas_cost, shadow_spread_threshold
+                        )
+                        
                         if opp:
                             opportunities.append(opp)
+                        elif shadow:
+                            shadow_opportunities.append(shadow)
                             
                     except Exception as e:
                         # 安全机制 3: 单个配对失败不影响整体扫描
                         # 静默处理，避免日志刷屏
                         pass
         
-        return opportunities
+        return opportunities, shadow_opportunities
     
     def _check_pair_opportunity(
         self,
@@ -437,7 +522,7 @@ class ArbitrageScanner:
         gas_cost: int
     ) -> Optional[ArbitrageOpportunity]:
         """
-        检查两个配对之间的套利机会
+        检查两个配对之间的套利机会（旧版兼容）
         
         参数：
             pair_a: 第一个配对
@@ -446,6 +531,28 @@ class ArbitrageScanner:
             
         返回：
             套利机会或 None
+        """
+        opp, _ = self._check_pair_opportunity_with_shadow(pair_a, pair_b, gas_cost, 0.0)
+        return opp
+    
+    def _check_pair_opportunity_with_shadow(
+        self,
+        pair_a: PairInfo,
+        pair_b: PairInfo,
+        gas_cost: int,
+        shadow_spread_threshold: float = 0.005
+    ) -> Tuple[Optional[ArbitrageOpportunity], Optional[ShadowOpportunity]]:
+        """
+        检查两个配对之间的套利机会（支持 Shadow Mode）
+        
+        参数：
+            pair_a: 第一个配对
+            pair_b: 第二个配对
+            gas_cost: Gas 成本（wei）
+            shadow_spread_threshold: Shadow Mode 价差阈值
+            
+        返回：
+            (套利机会, Shadow 机会) - 只有一个会非空
         """
         weth_lower = WETH_ADDRESS.lower()
         
@@ -474,59 +581,145 @@ class ArbitrageScanner:
             test_amounts=TEST_BORROW_AMOUNTS
         )
         
-        if not result.profitable:
-            return None
+        # 计算价差百分比
+        spread_percent = result.price_diff_bps / 100.0  # bps -> %
         
-        # 检查扣除 gas 后是否有利可图
-        is_profitable, net_profit = is_profitable_after_gas(result, gas_cost, self.min_profit_wei)
+        # 计算成本分解
+        # DEX 费用 = 借入金额 * 0.3% * 2 (两次 swap)
+        dex_fee_wei = int(opt_amount * 0.003 * 2)
+        # 闪电贷费用
+        flash_fee_wei = int(opt_amount * 0.003)
+        # 滑点损失估算 = 预期输出 - 实际输出（基于 AMM 计算）
+        # 简化：用价差和借入金额估算
+        expected_no_slippage = int(opt_amount * (1 + spread_percent / 100))
+        slippage_loss_wei = max(0, expected_no_slippage - result.swap2_output) if result.swap2_output > 0 else 0
         
-        if not is_profitable:
-            return None
-        
-        # 构造套利机会对象
+        # 构造方向字符串
         if direction == "forward":
             dir_str = f"{pair_a.dex_name} -> {pair_b.dex_name}"
         else:
             dir_str = f"{pair_b.dex_name} -> {pair_a.dex_name}"
         
-        return ArbitrageOpportunity(
-            pair_a=pair_a,
-            pair_b=pair_b,
-            direction=dir_str,
-            borrow_amount=opt_amount,
-            expected_profit=result.profit,
-            profit_after_gas=net_profit,
-            price_diff_bps=result.price_diff_bps,
-            timestamp=time.time()
+        # 检查扣除 gas 后是否有利可图
+        is_profitable, net_profit = is_profitable_after_gas(result, gas_cost, self.min_profit_wei)
+        
+        if is_profitable and result.profitable:
+            # 发现有利可图的套利机会
+            return ArbitrageOpportunity(
+                pair_a=pair_a,
+                pair_b=pair_b,
+                direction=dir_str,
+                borrow_amount=opt_amount,
+                expected_profit=result.profit,
+                profit_after_gas=net_profit,
+                price_diff_bps=result.price_diff_bps,
+                timestamp=time.time(),
+                spread_percent=spread_percent,
+                gas_cost_wei=gas_cost,
+                slippage_loss_wei=slippage_loss_wei,
+                dex_fee_wei=dex_fee_wei
+            ), None
+        
+        # Shadow Mode: 检查是否价差足够但利润为负
+        if spread_percent >= shadow_spread_threshold * 100:  # 转换为百分比
+            # 确定拒绝原因
+            if not result.profitable:
+                rejection_reason = "Gross profit negative (slippage > spread)"
+            elif net_profit < 0:
+                rejection_reason = "Gas cost exceeds gross profit"
+            elif net_profit < self.min_profit_wei:
+                rejection_reason = "Net profit below minimum threshold"
+            else:
+                rejection_reason = "Unknown"
+            
+            shadow = ShadowOpportunity(
+                pair_a=pair_a,
+                pair_b=pair_b,
+                direction=dir_str,
+                spread_percent=spread_percent,
+                expected_profit_wei=result.profit - gas_cost,
+                gas_cost_wei=gas_cost,
+                slippage_loss_wei=slippage_loss_wei,
+                dex_fee_wei=dex_fee_wei + flash_fee_wei,
+                rejection_reason=rejection_reason,
+                timestamp=time.time()
+            )
+            return None, shadow
+        
+        return None, None
+    
+    def scan(self, shadow_spread_threshold: float = 0.005) -> ScanResult:
+        """
+        执行一次扫描（返回完整扫描结果，包含延迟指标）
+        
+        🚀 Super-Batch Multicall: 所有配对在单次请求中获取
+        📊 包含 End-to-End Latency Profiling
+        
+        参数：
+            shadow_spread_threshold: Shadow Mode 价差阈值（默认 0.5%）
+        
+        返回：
+            ScanResult 包含机会列表和延迟指标
+        """
+        t_start = time.time()
+        
+        # 🚀 Step 1: Super-Batch Multicall 获取所有储备
+        success, network_time_ms, pairs_with_data = self.update_reserves()
+        
+        if not success:
+            return ScanResult(
+                opportunities=[],
+                time_network_ms=network_time_ms,
+                time_calc_ms=0.0,
+                time_total_ms=(time.time() - t_start) * 1000,
+                pairs_scanned=len(self.pairs),
+                pairs_with_data=0
+            )
+        
+        # 📊 Step 2: 计算套利机会
+        t_calc_start = time.time()
+        opportunities, shadow_opportunities = self.find_opportunities(shadow_spread_threshold)
+        t_calc_end = time.time()
+        calc_time_ms = (t_calc_end - t_calc_start) * 1000
+        
+        # 更新统计
+        self.scan_count += 1
+        self.opportunity_count += len(opportunities)
+        self.last_scan_time = time.time() - t_start
+        
+        # 保存 shadow 机会供外部访问
+        self._last_shadow_opportunities = shadow_opportunities
+        
+        return ScanResult(
+            opportunities=opportunities,
+            time_network_ms=network_time_ms,
+            time_calc_ms=calc_time_ms,
+            time_total_ms=(time.time() - t_start) * 1000,
+            pairs_scanned=len(self.pairs),
+            pairs_with_data=pairs_with_data
         )
     
-    def run_once(self) -> List[ArbitrageOpportunity]:
+    def get_last_shadow_opportunities(self) -> List[ShadowOpportunity]:
+        """获取上次扫描的 Shadow 机会"""
+        return getattr(self, '_last_shadow_opportunities', [])
+    
+    def run_once(self, shadow_spread_threshold: float = 0.005) -> List[ArbitrageOpportunity]:
         """
-        执行一次扫描
+        执行一次扫描（旧版兼容）
         
         返回：
             发现的套利机会列表
         """
-        start_time = time.time()
-        
-        # 更新储备
-        if not self.update_reserves():
-            return []
-        
-        # 寻找机会
-        opportunities = self.find_opportunities()
-        
-        self.scan_count += 1
-        self.opportunity_count += len(opportunities)
-        self.last_scan_time = time.time() - start_time
-        
-        return opportunities
+        result = self.scan(shadow_spread_threshold)
+        return result.opportunities
     
     def run_loop(
         self,
         interval: float = 1.0,
         max_iterations: Optional[int] = None,
-        callback: Optional[callable] = None
+        callback: Optional[callable] = None,
+        shadow_spread_threshold: float = 0.005,
+        show_latency: bool = True
     ):
         """
         持续运行扫描循环
@@ -535,31 +728,34 @@ class ArbitrageScanner:
             interval: 扫描间隔（秒）
             max_iterations: 最大迭代次数（None 表示无限）
             callback: 发现机会时的回调函数
+            shadow_spread_threshold: Shadow Mode 价差阈值
+            show_latency: 是否显示延迟指标
         """
         iteration = 0
         
         print("\n" + "=" * 60)
-        print("套利扫描器启动")
+        print("套利扫描器启动 (Super-Batch Multicall)")
         print("=" * 60)
         print(f"监控配对数量: {len(self.pairs)}")
         print(f"配对组数量: {len(self.pair_groups)}")
         print(f"扫描间隔: {interval} 秒")
         print(f"Gas 价格: {self.gas_price_gwei} Gwei")
+        print(f"Shadow Mode 阈值: {shadow_spread_threshold * 100:.1f}%")
         print("=" * 60 + "\n")
         
         try:
             while max_iterations is None or iteration < max_iterations:
                 iteration += 1
                 
-                # 执行扫描
-                opportunities = self.run_once()
+                # 执行扫描（使用新的 scan() 方法）
+                scan_result = self.scan(shadow_spread_threshold)
                 
                 # 输出结果
-                self._print_scan_result(iteration, opportunities)
+                self._print_scan_result_v2(iteration, scan_result, show_latency)
                 
                 # 调用回调
-                if callback and opportunities:
-                    for opp in opportunities:
+                if callback and scan_result.opportunities:
+                    for opp in scan_result.opportunities:
                         callback(opp)
                 
                 # 等待下一次扫描
@@ -577,7 +773,7 @@ class ArbitrageScanner:
         iteration: int,
         opportunities: List[ArbitrageOpportunity]
     ):
-        """打印扫描结果"""
+        """打印扫描结果（旧版兼容）"""
         timestamp = time.strftime("%H:%M:%S")
         
         if opportunities:
@@ -596,6 +792,49 @@ class ArbitrageScanner:
         else:
             # 简洁输出
             print(f"[{timestamp}] 扫描 #{iteration}: 无套利机会 ({self.last_scan_time*1000:.1f}ms)", end="\r")
+    
+    def _print_scan_result_v2(
+        self,
+        iteration: int,
+        scan_result: ScanResult,
+        show_latency: bool = True
+    ):
+        """打印扫描结果（包含延迟指标和 Shadow Mode）"""
+        timestamp = time.strftime("%H:%M:%S")
+        opportunities = scan_result.opportunities
+        shadow_opps = self.get_last_shadow_opportunities()
+        
+        if opportunities:
+            print(f"\n🎯 [{timestamp}] 第 {iteration} 次扫描 - 发现 {len(opportunities)} 个机会!")
+            if show_latency:
+                print(f"⏱️ LATENCY: {scan_result.get_latency_str()}")
+            print("-" * 60)
+            
+            for opp in opportunities:
+                profit_eth = opp.profit_after_gas / 10**18
+                borrow_eth = opp.borrow_amount / 10**18
+                
+                print(f"  方向: {opp.direction}")
+                print(f"  借入: {borrow_eth:.4f} ETH")
+                print(f"  净利润: {profit_eth:.6f} ETH (${profit_eth * 3000:.2f})")
+                print(f"  价格差异: {opp.price_diff_bps:.2f} bps ({opp.spread_percent:.3f}%)")
+                print()
+        elif shadow_opps:
+            # Shadow Mode: 打印被拒绝的机会
+            print(f"\n⚠️ [{timestamp}] [SHADOW] 发现 {len(shadow_opps)} 个潜在机会被拒绝:")
+            if show_latency:
+                print(f"⏱️ LATENCY: {scan_result.get_latency_str()}")
+            print("-" * 60)
+            
+            for shadow in shadow_opps[:3]:  # 只显示前3个
+                print(f"  [SHADOW] {shadow.direction}")
+                print(f"    {shadow.get_breakdown_str()}")
+                print(f"    Reason: {shadow.rejection_reason}")
+                print()
+        else:
+            # 简洁输出
+            latency_str = f" | {scan_result.get_latency_str()}" if show_latency else ""
+            print(f"[{timestamp}] 扫描 #{iteration}: 无套利机会{latency_str}", end="\r")
     
     def _print_stats(self):
         """打印统计信息"""
