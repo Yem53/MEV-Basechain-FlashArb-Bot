@@ -27,6 +27,7 @@
 import os
 import sys
 import time
+import math
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, NamedTuple
 from dataclasses import dataclass, field
@@ -438,14 +439,17 @@ class ArbitrageScanner:
     
     def find_opportunities(
         self, 
-        shadow_spread_threshold: float = 0.005
+        shadow_spread_threshold: float = 0.005,
+        debug_liquidity: bool = False
     ) -> Tuple[List[ArbitrageOpportunity], List[ShadowOpportunity]]:
         """
         在所有配对组中寻找套利机会
         
         安全机制：
         1. 最小流动性检查 - 跳过 WETH < 0.5 ETH 的池
-        2. 健壮错误处理 - 单个 DEX 失败不影响其他扫描
+        2. 价格有效性检查 - 跳过价格为 0 或无穷大的池
+        3. 储备比例检查 - 跳过极端比例的池（防止 dust pool）
+        4. 健壮错误处理 - 单个 DEX 失败不影响其他扫描
         
         Shadow Mode:
         - 记录价差超过阈值但利润为负的机会
@@ -453,6 +457,7 @@ class ArbitrageScanner:
         
         参数：
             shadow_spread_threshold: Shadow Mode 价差阈值（默认 0.5%）
+            debug_liquidity: 是否输出流动性过滤的调试日志
         
         返回：
             (套利机会列表, Shadow 机会列表)
@@ -460,6 +465,11 @@ class ArbitrageScanner:
         opportunities = []
         shadow_opportunities = []
         gas_cost = estimate_gas_cost(self.gas_price_gwei, FLASH_SWAP_GAS)
+        
+        # 统计跳过的配对（用于调试）
+        skipped_low_liquidity = 0
+        skipped_invalid_price = 0
+        skipped_dust_pool = 0
         
         for tokens, group in self.pair_groups.items():
             if len(group.pairs) < 2:
@@ -472,33 +482,117 @@ class ArbitrageScanner:
                     pair_b = group.pairs[j]
                     
                     try:
-                        # 安全检查 1: 跳过没有储备的配对
-                        if pair_a.reserve0 == 0 or pair_b.reserve0 == 0:
+                        # ============================================
+                        # 🛡️ 安全检查 1: 跳过零储备配对
+                        # ============================================
+                        if pair_a.reserve0 == 0 or pair_a.reserve1 == 0:
+                            skipped_dust_pool += 1
+                            if debug_liquidity:
+                                print(f"[DEBUG] Skipping {pair_a.dex_name} pair: zero reserve (r0={pair_a.reserve0}, r1={pair_a.reserve1})")
+                            continue
+                        if pair_b.reserve0 == 0 or pair_b.reserve1 == 0:
+                            skipped_dust_pool += 1
+                            if debug_liquidity:
+                                print(f"[DEBUG] Skipping {pair_b.dex_name} pair: zero reserve (r0={pair_b.reserve0}, r1={pair_b.reserve1})")
                             continue
                         
-                        # 安全检查 2: 最小流动性过滤
-                        # 检查 pair_a 的 WETH 流动性
+                        # ============================================
+                        # 🛡️ 安全检查 2: 最小流动性过滤
+                        # ============================================
                         weth_lower = WETH_ADDRESS.lower()
                         
                         # 确定 WETH 在 pair_a 中的储备
                         if pair_a.token0.lower() == weth_lower:
                             pair_a_weth_reserve = pair_a.reserve0
+                            pair_a_other_reserve = pair_a.reserve1
                         else:
                             pair_a_weth_reserve = pair_a.reserve1
+                            pair_a_other_reserve = pair_a.reserve0
                         
                         # 确定 WETH 在 pair_b 中的储备
                         if pair_b.token0.lower() == weth_lower:
                             pair_b_weth_reserve = pair_b.reserve0
+                            pair_b_other_reserve = pair_b.reserve1
                         else:
                             pair_b_weth_reserve = pair_b.reserve1
+                            pair_b_other_reserve = pair_b.reserve0
                         
-                        # 跳过流动性不足的池
+                        # 跳过流动性不足的池（WETH < 0.5 ETH）
                         if pair_a_weth_reserve < MIN_LIQUIDITY_WEI:
+                            skipped_low_liquidity += 1
+                            if debug_liquidity:
+                                eth_reserve = pair_a_weth_reserve / 10**18
+                                print(f"[DEBUG] Skipping {pair_a.dex_name} pair due to low liquidity: {eth_reserve:.4f} ETH < {MIN_LIQUIDITY_ETH} ETH")
                             continue
                         if pair_b_weth_reserve < MIN_LIQUIDITY_WEI:
+                            skipped_low_liquidity += 1
+                            if debug_liquidity:
+                                eth_reserve = pair_b_weth_reserve / 10**18
+                                print(f"[DEBUG] Skipping {pair_b.dex_name} pair due to low liquidity: {eth_reserve:.4f} ETH < {MIN_LIQUIDITY_ETH} ETH")
                             continue
                         
-                        # 检查两个方向的套利机会
+                        # ============================================
+                        # 🛡️ 安全检查 3: 价格有效性检查
+                        # ============================================
+                        # 计算价格比率，检查是否为 0 或无穷大
+                        try:
+                            price_a = pair_a_other_reserve / pair_a_weth_reserve
+                            price_b = pair_b_other_reserve / pair_b_weth_reserve
+                            
+                            # 检查无效价格
+                            if price_a <= 0 or price_b <= 0:
+                                skipped_invalid_price += 1
+                                if debug_liquidity:
+                                    print(f"[DEBUG] Skipping pair: invalid price (price_a={price_a}, price_b={price_b})")
+                                continue
+                            
+                            # 检查价格是否为无穷大或 NaN
+                            if math.isinf(price_a) or math.isnan(price_a) or math.isinf(price_b) or math.isnan(price_b):
+                                skipped_invalid_price += 1
+                                if debug_liquidity:
+                                    print(f"[DEBUG] Skipping pair: inf/nan price (price_a={price_a}, price_b={price_b})")
+                                continue
+                            
+                            # 检查极端价格比（可能是 dust pool）
+                            # 如果两个池的价格差异超过 1000 倍，跳过
+                            price_ratio = max(price_a, price_b) / min(price_a, price_b) if min(price_a, price_b) > 0 else float('inf')
+                            if price_ratio > 1000:
+                                skipped_dust_pool += 1
+                                if debug_liquidity:
+                                    print(f"[DEBUG] Skipping pair: extreme price ratio ({price_ratio:.0f}x) - likely dust pool")
+                                continue
+                                
+                        except (ZeroDivisionError, OverflowError):
+                            skipped_invalid_price += 1
+                            if debug_liquidity:
+                                print(f"[DEBUG] Skipping pair: price calculation error")
+                            continue
+                        
+                        # ============================================
+                        # 🛡️ 安全检查 4: 储备比例健全性检查
+                        # ============================================
+                        # 检查是否有极端的储备比例（可能是假池或攻击池）
+                        # 正常池的 token/WETH 比例应该在合理范围内
+                        # 例如：1 WETH = 1000-100000 代币是合理的
+                        # 但 1 WETH = 1e15 代币可能是 dust pool
+                        MAX_TOKEN_PER_ETH = 10**15  # 每 ETH 最多 1e15 代币
+                        MIN_TOKEN_PER_ETH = 10**-6  # 每 ETH 最少 1e-6 代币
+                        
+                        if price_a > MAX_TOKEN_PER_ETH or price_b > MAX_TOKEN_PER_ETH:
+                            skipped_dust_pool += 1
+                            if debug_liquidity:
+                                print(f"[DEBUG] Skipping pair: token/ETH ratio too high (likely dust pool)")
+                            continue
+                        
+                        if price_a < MIN_TOKEN_PER_ETH or price_b < MIN_TOKEN_PER_ETH:
+                            skipped_dust_pool += 1
+                            if debug_liquidity:
+                                print(f"[DEBUG] Skipping pair: token/ETH ratio too low (likely invalid pool)")
+                            continue
+                        
+                        # ============================================
+                        # ✅ 通过所有检查，计算套利机会
+                        # ============================================
                         opp, shadow = self._check_pair_opportunity_with_shadow(
                             pair_a, pair_b, gas_cost, shadow_spread_threshold
                         )
@@ -509,9 +603,14 @@ class ArbitrageScanner:
                             shadow_opportunities.append(shadow)
                             
                     except Exception as e:
-                        # 安全机制 3: 单个配对失败不影响整体扫描
-                        # 静默处理，避免日志刷屏
+                        # 安全机制: 单个配对失败不影响整体扫描
+                        if debug_liquidity:
+                            print(f"[DEBUG] Exception processing pair: {e}")
                         pass
+        
+        # 输出过滤统计（仅在调试模式）
+        if debug_liquidity and (skipped_low_liquidity + skipped_invalid_price + skipped_dust_pool) > 0:
+            print(f"[DEBUG] Filtered pairs: low_liquidity={skipped_low_liquidity}, invalid_price={skipped_invalid_price}, dust_pool={skipped_dust_pool}")
         
         return opportunities, shadow_opportunities
     
@@ -648,15 +747,21 @@ class ArbitrageScanner:
         
         return None, None
     
-    def scan(self, shadow_spread_threshold: float = 0.005) -> ScanResult:
+    def scan(
+        self, 
+        shadow_spread_threshold: float = 0.005,
+        debug_liquidity: bool = False
+    ) -> ScanResult:
         """
         执行一次扫描（返回完整扫描结果，包含延迟指标）
         
         🚀 Super-Batch Multicall: 所有配对在单次请求中获取
         📊 包含 End-to-End Latency Profiling
+        🛡️ 流动性过滤: 跳过 dust pool 和无效池
         
         参数：
             shadow_spread_threshold: Shadow Mode 价差阈值（默认 0.5%）
+            debug_liquidity: 是否输出流动性过滤调试日志
         
         返回：
             ScanResult 包含机会列表和延迟指标
@@ -678,7 +783,10 @@ class ArbitrageScanner:
         
         # 📊 Step 2: 计算套利机会
         t_calc_start = time.time()
-        opportunities, shadow_opportunities = self.find_opportunities(shadow_spread_threshold)
+        opportunities, shadow_opportunities = self.find_opportunities(
+            shadow_spread_threshold=shadow_spread_threshold,
+            debug_liquidity=debug_liquidity
+        )
         t_calc_end = time.time()
         calc_time_ms = (t_calc_end - t_calc_start) * 1000
         

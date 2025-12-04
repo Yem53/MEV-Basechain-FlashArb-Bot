@@ -96,6 +96,12 @@ SHADOW_MODE_ENABLED = os.getenv("SHADOW_MODE", "true").lower() == "true"
 # ============================================
 LATENCY_PROFILING_ENABLED = os.getenv("LATENCY_PROFILING", "true").lower() == "true"
 
+# ============================================
+# 🛡️ 流动性过滤调试
+# ============================================
+# 启用后会输出被跳过的 dust pool 和低流动性池的详细信息
+DEBUG_LIQUIDITY = os.getenv("DEBUG_LIQUIDITY", "false").lower() == "true"
+
 # ==========================================
 # 🎯 Base Mainnet Target Tokens (Verified)
 # ==========================================
@@ -257,6 +263,9 @@ class FlashArbBot:
         
         # ⏱️ 延迟分析配置
         self.latency_profiling_enabled = LATENCY_PROFILING_ENABLED
+        
+        # 🛡️ 流动性过滤调试
+        self.debug_liquidity = DEBUG_LIQUIDITY
         
         # 冷却机制：记录失败的机会
         # {token_address: {"timestamp": float, "count": int, "cooldown": int}}

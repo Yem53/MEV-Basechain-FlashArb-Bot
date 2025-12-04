@@ -292,11 +292,11 @@ interface ISolidlyRouter {
 }
 
 // ============================================
-// 未来扩展预留：Uniswap V3
+// Uniswap V3 接口
 // ============================================
 
 /**
- * @dev Uniswap V3 Swap 回调接口（预留）
+ * @dev Uniswap V3 Swap 回调接口
  */
 interface IUniswapV3SwapCallback {
     function uniswapV3SwapCallback(
@@ -304,6 +304,121 @@ interface IUniswapV3SwapCallback {
         int256 amount1Delta,
         bytes calldata data
     ) external;
+}
+
+/**
+ * @dev Uniswap V3 SwapRouter 接口
+ * @notice 用于在 V3 池中执行精确输入单跳交换
+ * 
+ * Base Mainnet V3 Router: 0x2626664c2603336E57B271c5C0b26F421741e481 (SwapRouter02)
+ * 
+ * 常用费率 (fee tiers):
+ * - 100   = 0.01% (稳定币对)
+ * - 500   = 0.05% (稳定币/主流)
+ * - 3000  = 0.30% (大多数交易对)
+ * - 10000 = 1.00% (高波动性代币)
+ */
+interface IV3SwapRouter {
+    /**
+     * @notice 精确输入单跳交换参数
+     * @param tokenIn 输入代币地址
+     * @param tokenOut 输出代币地址
+     * @param fee 池费率（100, 500, 3000, 10000）
+     * @param recipient 接收者地址
+     * @param deadline 交易截止时间
+     * @param amountIn 输入金额
+     * @param amountOutMinimum 最小输出金额（滑点保护）
+     * @param sqrtPriceLimitX96 价格限制（0 表示无限制）
+     */
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+    
+    /**
+     * @notice 执行精确输入单跳交换
+     * @param params ExactInputSingleParams 结构体
+     * @return amountOut 实际输出金额
+     */
+    function exactInputSingle(
+        ExactInputSingleParams calldata params
+    ) external payable returns (uint256 amountOut);
+    
+    /**
+     * @notice 精确输入多跳交换参数
+     * @param path 编码的路径（tokenIn, fee, tokenOut, fee, tokenOut2, ...）
+     * @param recipient 接收者地址
+     * @param deadline 交易截止时间
+     * @param amountIn 输入金额
+     * @param amountOutMinimum 最小输出金额
+     */
+    struct ExactInputParams {
+        bytes path;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+    }
+    
+    /**
+     * @notice 执行精确输入多跳交换
+     * @param params ExactInputParams 结构体
+     * @return amountOut 实际输出金额
+     */
+    function exactInput(
+        ExactInputParams calldata params
+    ) external payable returns (uint256 amountOut);
+    
+    /**
+     * @notice 精确输出单跳交换参数
+     */
+    struct ExactOutputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 deadline;
+        uint256 amountOut;
+        uint256 amountInMaximum;
+        uint160 sqrtPriceLimitX96;
+    }
+    
+    /**
+     * @notice 执行精确输出单跳交换
+     * @param params ExactOutputSingleParams 结构体
+     * @return amountIn 实际输入金额
+     */
+    function exactOutputSingle(
+        ExactOutputSingleParams calldata params
+    ) external payable returns (uint256 amountIn);
+}
+
+/**
+ * @dev Uniswap V3 Quoter 接口（只读，用于报价）
+ */
+interface IV3Quoter {
+    /**
+     * @notice 获取精确输入单跳交换的报价
+     * @param tokenIn 输入代币
+     * @param tokenOut 输出代币
+     * @param fee 费率
+     * @param amountIn 输入金额
+     * @param sqrtPriceLimitX96 价格限制
+     * @return amountOut 预期输出金额
+     */
+    function quoteExactInputSingle(
+        address tokenIn,
+        address tokenOut,
+        uint24 fee,
+        uint256 amountIn,
+        uint160 sqrtPriceLimitX96
+    ) external returns (uint256 amountOut);
 }
 
 // ============================================

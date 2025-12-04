@@ -35,6 +35,14 @@ contract FlashBot is IUniswapV2Callee, IPancakeCallee {
     /// @notice Aerodrome Factory (Base Mainnet)
     /// @dev 用于构建 Route 结构
     address public constant AERODROME_FACTORY = 0x420DD381b31aEf6683db6B902084cB0FFECe40Da;
+    
+    /// @notice Uniswap V3 SwapRouter02 (Base Mainnet)
+    /// @dev Universal Router 兼容的 SwapRouter
+    address public constant UNISWAP_V3_ROUTER = 0x2626664c2603336E57B271c5C0b26F421741e481;
+    
+    /// @notice V3 默认费率 (0.3%)
+    /// @dev 常用费率: 100 (0.01%), 500 (0.05%), 3000 (0.3%), 10000 (1%)
+    uint24 public constant DEFAULT_V3_FEE = 3000;
 
     // ============================================
     // 状态变量（最小化以节省 gas）
@@ -209,12 +217,24 @@ contract FlashBot is IUniswapV2Callee, IPancakeCallee {
     
     /**
      * @notice 协议类型枚举
-     * @dev 用于区分不同的闪电贷来源
+     * @dev 用于区分不同的 DEX 协议
      */
     enum Protocol {
-        UNISWAP_V2,     // Uniswap V2 及分叉（SushiSwap, PancakeSwap）
-        UNISWAP_V3,     // Uniswap V3（未来实现）
+        UNISWAP_V2,     // Uniswap V2 及分叉（SushiSwap, PancakeSwap, BaseSwap）
+        SOLIDLY,        // Solidly 分叉（Aerodrome, Velodrome）
+        UNISWAP_V3,     // Uniswap V3
         AAVE_V3         // Aave V3 闪电贷（未来实现）
+    }
+    
+    /**
+     * @notice V3 交换参数结构体
+     * @dev 用于传递 V3 特定参数
+     */
+    struct V3SwapParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        uint256 amountIn;
     }
     
     /**
@@ -440,12 +460,14 @@ contract FlashBot is IUniswapV2Callee, IPancakeCallee {
         uint256 balanceBefore = IERC20(tokenBorrow).balanceOf(address(this));
         
         // ===== 解码参数并执行套利 =====
-        // 简化版：根据数据长度判断模式
-        // 两跳模式使用统一格式: (router1, path1, router2, path2)
-        // 合约会自动检测 Aerodrome 并使用 Solidly 接口
+        // 根据数据长度判断模式:
+        // - <= 200: 单路由器模式 (router, path)
+        // - > 200, <= 320: 跨 V2/Solidly 模式 (router1, path1, router2, path2)
+        // - > 320: 跨协议模式含 V3 (router1, path1, router2, path2, v3Fee1, v3Fee2)
+        // 合约会自动检测 Aerodrome/V3 Router 并使用对应接口
         if (data.length > 200) {
-            // 跨 DEX 模式（包括 V2 + Solidly 混合）
-            _executeCrossV2Swap(data, amountBorrowed);
+            // 跨 DEX 模式（V2 + Solidly + V3 混合）
+            _executeCrossSwap(data, amountBorrowed);
         } else {
             // 单路由器模式（向后兼容）
             _executeSingleSwap(data, amountBorrowed);
@@ -480,35 +502,60 @@ contract FlashBot is IUniswapV2Callee, IPancakeCallee {
     }
     
     /**
-     * @notice 执行单路由器 swap（V2 或 Solidly）
+     * @notice 执行单路由器 swap（V2、Solidly 或 V3）
+     * @dev 数据格式:
+     *      - V2/Solidly: abi.encode(router, path)
+     *      - V3: abi.encode(router, path, v3Fee) - path 只需 [tokenIn, tokenOut]
      */
     function _executeSingleSwap(bytes calldata data, uint256 amountIn) internal {
-        (address router, address[] memory path) = abi.decode(data, (address, address[]));
-        
-        if (router == AERODROME_ROUTER) {
-            // Solidly swap - 需要包含 factory 地址
-            Route[] memory routes = new Route[](path.length - 1);
-            for (uint256 i = 0; i < path.length - 1; i++) {
-                routes[i] = Route({
-                    from: path[i],
-                    to: path[i + 1],
-                    stable: false,
-                    factory: AERODROME_FACTORY
-                });
-            }
-            ISolidlyRouter(router).swapExactTokensForTokens(
-                amountIn, 0, routes, address(this), block.timestamp + 300
-            );
+        // 尝试解码带 V3 费率的格式
+        if (data.length > 128) {
+            // 可能包含 V3 费率
+            (address router, address[] memory path, uint24 v3Fee) = 
+                abi.decode(data, (address, address[], uint24));
+            _executeSwap(router, path, amountIn, v3Fee);
         } else {
-            // V2 swap
-            IUniswapV2Router(router).swapExactTokensForTokens(
-                amountIn, 0, path, address(this), block.timestamp + 300
-            );
+            // 标准 V2/Solidly 格式
+            (address router, address[] memory path) = abi.decode(data, (address, address[]));
+            _executeSwap(router, path, amountIn, 0);
         }
     }
     
     /**
-     * @notice 执行跨 V2 DEX swap
+     * @notice 执行跨 DEX swap（支持 V2、Solidly、V3）
+     * @dev 数据格式: abi.encode(router1, path1, router2, path2, v3Fee1, v3Fee2)
+     *      - v3Fee1/v3Fee2: 如果对应路由器是 V3，则使用此费率；否则传 0
+     */
+    function _executeCrossSwap(bytes calldata data, uint256 amountIn) internal {
+        // 尝试解码带 V3 费率的格式
+        if (data.length > 320) {
+            // 新格式：包含 V3 费率
+            (
+                address router1,
+                address[] memory path1,
+                address router2,
+                address[] memory path2,
+                uint24 v3Fee1,
+                uint24 v3Fee2
+            ) = abi.decode(data, (address, address[], address, address[], uint24, uint24));
+            
+            // 第一跳
+            _executeSwap(router1, path1, amountIn, v3Fee1);
+            
+            // 获取中间代币余额
+            address intermediateToken = path1[path1.length - 1];
+            uint256 intermediateAmount = IERC20(intermediateToken).balanceOf(address(this));
+            
+            // 第二跳
+            _executeSwap(router2, path2, intermediateAmount, v3Fee2);
+        } else {
+            // 旧格式：不包含 V3 费率（向后兼容）
+            _executeCrossV2Swap(data, amountIn);
+        }
+    }
+    
+    /**
+     * @notice 执行跨 V2 DEX swap（向后兼容）
      */
     function _executeCrossV2Swap(bytes calldata data, uint256 amountIn) internal {
         (
@@ -557,17 +604,22 @@ contract FlashBot is IUniswapV2Callee, IPancakeCallee {
     }
     
     /**
-     * @notice 根据路由器类型执行 swap
+     * @notice 根据路由器类型执行 swap（支持 V2、Solidly、V3）
      * @param router 路由器地址
-     * @param path 交易路径
+     * @param path 交易路径（V2/Solidly）或 [tokenIn, tokenOut]（V3）
      * @param amountIn 输入金额
+     * @param v3Fee V3 费率（仅 V3 使用，其他传 0）
      */
-    function _executeV2OrSolidlySwap(
+    function _executeSwap(
         address router,
         address[] memory path,
-        uint256 amountIn
+        uint256 amountIn,
+        uint24 v3Fee
     ) internal {
-        if (router == AERODROME_ROUTER) {
+        if (router == UNISWAP_V3_ROUTER) {
+            // Uniswap V3 swap
+            _executeV3Swap(path[0], path[path.length - 1], v3Fee, amountIn);
+        } else if (router == AERODROME_ROUTER) {
             // Solidly swap - 需要包含 factory 地址
             Route[] memory routes = new Route[](path.length - 1);
             for (uint256 i = 0; i < path.length - 1; i++) {
@@ -587,6 +639,68 @@ contract FlashBot is IUniswapV2Callee, IPancakeCallee {
                 amountIn, 0, path, address(this), block.timestamp + 300
             );
         }
+    }
+    
+    /**
+     * @notice 向后兼容的 V2/Solidly swap 函数
+     * @dev 内部调用 _executeSwap，v3Fee 传 0
+     */
+    function _executeV2OrSolidlySwap(
+        address router,
+        address[] memory path,
+        uint256 amountIn
+    ) internal {
+        _executeSwap(router, path, amountIn, 0);
+    }
+    
+    /**
+     * @notice 执行 Uniswap V3 精确输入单跳交换
+     * @param tokenIn 输入代币
+     * @param tokenOut 输出代币
+     * @param fee 池费率
+     * @param amountIn 输入金额
+     */
+    function _executeV3Swap(
+        address tokenIn,
+        address tokenOut,
+        uint24 fee,
+        uint256 amountIn
+    ) internal {
+        // 使用默认费率如果未指定
+        uint24 actualFee = fee > 0 ? fee : DEFAULT_V3_FEE;
+        
+        IV3SwapRouter.ExactInputSingleParams memory params = IV3SwapRouter.ExactInputSingleParams({
+            tokenIn: tokenIn,
+            tokenOut: tokenOut,
+            fee: actualFee,
+            recipient: address(this),
+            deadline: block.timestamp + 300,
+            amountIn: amountIn,
+            amountOutMinimum: 0,  // MEV 套利不需要滑点保护
+            sqrtPriceLimitX96: 0  // 不限制价格
+        });
+        
+        IV3SwapRouter(UNISWAP_V3_ROUTER).exactInputSingle(params);
+    }
+    
+    /**
+     * @notice 执行 V3 多跳交换
+     * @param path 编码的路径 (tokenIn, fee, tokenMiddle, fee, tokenOut)
+     * @param amountIn 输入金额
+     */
+    function _executeV3MultiHop(
+        bytes memory path,
+        uint256 amountIn
+    ) internal {
+        IV3SwapRouter.ExactInputParams memory params = IV3SwapRouter.ExactInputParams({
+            path: path,
+            recipient: address(this),
+            deadline: block.timestamp + 300,
+            amountIn: amountIn,
+            amountOutMinimum: 0
+        });
+        
+        IV3SwapRouter(UNISWAP_V3_ROUTER).exactInput(params);
     }
 
     // ============================================
