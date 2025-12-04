@@ -39,6 +39,10 @@ DEFAULT_GAS_LIMIT = 500000
 MAX_GAS_PRICE_GWEI = 1.0
 TX_TIMEOUT = 60
 
+# Sniper Mode defaults (can be overridden by env)
+SNIPER_MODE_ENABLED = os.getenv("SNIPER_MODE_ENABLED", "true").lower() == "true"
+SNIPER_MODE_MULTIPLIER = float(os.getenv("SNIPER_MODE_MULTIPLIER", "1.2"))
+
 
 @dataclass
 class ExecutionResult:
@@ -123,16 +127,22 @@ class V3Executor:
             self._nonce = None
             self._nonce_time = 0
     
-    def _get_gas_params(self, sniper_mode: bool = True) -> Dict[str, int]:
+    def _get_gas_params(self, sniper_mode: bool = None) -> Dict[str, int]:
         """
         Get gas parameters (EIP-1559 or legacy).
         
         Args:
-            sniper_mode: If True, boost priority fee by 20%
+            sniper_mode: If True, boost priority fee. If None, use env setting.
         
         Returns:
             Gas parameters dict
         """
+        # Use env setting if not explicitly specified
+        if sniper_mode is None:
+            sniper_mode = SNIPER_MODE_ENABLED
+        
+        multiplier = SNIPER_MODE_MULTIPLIER if sniper_mode else 1.0
+        
         try:
             block = self.w3.eth.get_block("latest")
             base_fee = block.get("baseFeePerGas")
@@ -142,11 +152,11 @@ class V3Executor:
                 try:
                     priority_fee = self.w3.eth.max_priority_fee
                     if sniper_mode:
-                        priority_fee = int(priority_fee * 1.2)
+                        priority_fee = int(priority_fee * multiplier)
                 except Exception:
                     priority_fee = self.w3.to_wei(0.01, "gwei")
                     if sniper_mode:
-                        priority_fee = int(priority_fee * 1.2)
+                        priority_fee = int(priority_fee * multiplier)
                 
                 max_fee = base_fee * 2 + priority_fee
                 max_allowed = self.w3.to_wei(self.max_gas_gwei, "gwei")
@@ -161,7 +171,7 @@ class V3Executor:
                 # Legacy
                 gas_price = self.w3.eth.gas_price
                 if sniper_mode:
-                    gas_price = int(gas_price * 1.2)
+                    gas_price = int(gas_price * multiplier)
                 
                 max_allowed = self.w3.to_wei(self.max_gas_gwei, "gwei")
                 if gas_price > max_allowed:
@@ -233,8 +243,8 @@ class V3Executor:
             # Encode swap data
             swap_data = self._encode_swap_data(target_token, target_fee)
             
-            # Get gas params
-            gas_params = self._get_gas_params(sniper_mode=True)
+            # Get gas params (uses env settings for sniper mode)
+            gas_params = self._get_gas_params()
             
             # Get nonce
             nonce = self._get_nonce()

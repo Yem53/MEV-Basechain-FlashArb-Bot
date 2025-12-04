@@ -15,6 +15,7 @@ Base Mainnet Constants:
 - Init Code Hash: 0xe34f199b19b2b4f47f68442619d555527d244f78a3297ea89325f843f87b8b54
 """
 
+import os
 import time
 from decimal import Decimal, getcontext
 from typing import Dict, List, Optional, Tuple
@@ -27,20 +28,25 @@ from eth_abi import encode, decode
 getcontext().prec = 78
 
 # ============================================
-# V3 Constants - Base Mainnet
+# V3 Constants - Load from env or use defaults
 # ============================================
 
-V3_FACTORY = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD"
-SWAP_ROUTER = "0x2626664c2603336E57B271c5C0b26F421741e481"
-WETH = "0x4200000000000000000000000000000000000006"
-POOL_INIT_CODE_HASH = "0xe34f199b19b2b4f47f68442619d555527d244f78a3297ea89325f843f87b8b54"
+V3_FACTORY = os.getenv("V3_FACTORY", "0x33128a8fC17869897dcE68Ed026d694621f6FDfD")
+SWAP_ROUTER = os.getenv("SWAP_ROUTER", "0x2626664c2603336E57B271c5C0b26F421741e481")
+WETH = os.getenv("WETH", "0x4200000000000000000000000000000000000006")
+POOL_INIT_CODE_HASH = os.getenv("POOL_INIT_CODE_HASH", "0xe34f199b19b2b4f47f68442619d555527d244f78a3297ea89325f843f87b8b54")
+MULTICALL3 = os.getenv("MULTICALL3", "0xcA11bde05977b3631167028862bE2a173976CA11")
 
-# Fee tiers: 500 (0.05%), 3000 (0.3%), 10000 (1%)
-FEE_TIERS = [500, 3000, 10000]
-FEE_NAMES = {500: "0.05%", 3000: "0.3%", 10000: "1%"}
+# Fee tiers from env or defaults
+FEE_TIERS_STR = os.getenv("FEE_TIERS", "500,3000,10000")
+FEE_TIERS = [int(f.strip()) for f in FEE_TIERS_STR.split(",")]
+FEE_NAMES = {500: "0.05%", 3000: "0.3%", 10000: "1%", 100: "0.01%"}
 
 # Minimum liquidity threshold
-MIN_LIQUIDITY = 10**15  # ~0.001 units
+MIN_LIQUIDITY = int(os.getenv("MIN_LIQUIDITY", "1000000000000000"))  # 10^15
+
+# Debug mode
+DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
 # Function selectors
 SLOT0_SELECTOR = "0x3850c7bd"

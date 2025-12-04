@@ -44,36 +44,92 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 # Network
 RPC_URL = os.getenv("RPC_URL", "http://127.0.0.1:8545")
+RPC_TIMEOUT = int(os.getenv("RPC_TIMEOUT", "30"))
+CHAIN_ID = int(os.getenv("CHAIN_ID", "8453"))
 PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
 CONTRACT_ADDRESS = os.getenv("FLASHBOT_ADDRESS", "")
 
-# V3 Constants
-WETH = "0x4200000000000000000000000000000000000006"
-V3_FACTORY = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD"
-SWAP_ROUTER = "0x2626664c2603336E57B271c5C0b26F421741e481"
+# V3 Constants (Base Mainnet defaults)
+WETH = os.getenv("WETH", "0x4200000000000000000000000000000000000006")
+V3_FACTORY = os.getenv("V3_FACTORY", "0x33128a8fC17869897dcE68Ed026d694621f6FDfD")
+SWAP_ROUTER = os.getenv("SWAP_ROUTER", "0x2626664c2603336E57B271c5C0b26F421741e481")
+POOL_INIT_CODE_HASH = os.getenv("POOL_INIT_CODE_HASH", "0xe34f199b19b2b4f47f68442619d555527d244f78a3297ea89325f843f87b8b54")
+MULTICALL3 = os.getenv("MULTICALL3", "0xcA11bde05977b3631167028862bE2a173976CA11")
 
 # Arbitrage settings
 MIN_PROFIT_ETH = float(os.getenv("MIN_PROFIT_ETH", "0.001"))
 MIN_PROFIT_WEI = int(MIN_PROFIT_ETH * 10**18)
 BORROW_AMOUNT_ETH = float(os.getenv("BORROW_AMOUNT_ETH", "1.0"))
 BORROW_AMOUNT = int(BORROW_AMOUNT_ETH * 10**18)
+MAX_BORROW_ETH = float(os.getenv("MAX_BORROW_ETH", "10.0"))
+
+# Gas settings
+MAX_GAS_GWEI = float(os.getenv("MAX_GAS_GWEI", "1.0"))
+GAS_LIMIT = int(os.getenv("GAS_LIMIT", "500000"))
+SNIPER_MODE_ENABLED = os.getenv("SNIPER_MODE_ENABLED", "true").lower() == "true"
+SNIPER_MODE_MULTIPLIER = float(os.getenv("SNIPER_MODE_MULTIPLIER", "1.2"))
+
+# Fee tiers
+FEE_TIERS_STR = os.getenv("FEE_TIERS", "500,3000,10000")
+FEE_TIERS_CONFIG = [int(f.strip()) for f in FEE_TIERS_STR.split(",")]
+FLASH_FEE_TIER = int(os.getenv("FLASH_FEE_TIER", "500"))
 
 # Scanning
 SCAN_INTERVAL = float(os.getenv("SCAN_INTERVAL", "1.0"))
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
+
+# Profiling & Diagnostics
 LATENCY_PROFILING = os.getenv("LATENCY_PROFILING", "true").lower() == "true"
+SHADOW_MODE_ENABLED = os.getenv("SHADOW_MODE_ENABLED", "true").lower() == "true"
+SHADOW_SPREAD_THRESHOLD = float(os.getenv("SHADOW_SPREAD_THRESHOLD", "0.005"))
+
+# Liquidity filters
+MIN_LIQUIDITY = int(os.getenv("MIN_LIQUIDITY", "1000000000000000"))
+MIN_LIQUIDITY_ETH = float(os.getenv("MIN_LIQUIDITY_ETH", "0.5"))
+
+# Safety limits
+MAX_CONSECUTIVE_FAILURES = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "5"))
+FAILURE_PAUSE_DURATION = int(os.getenv("FAILURE_PAUSE_DURATION", "60"))
+MAX_TX_PER_HOUR = int(os.getenv("MAX_TX_PER_HOUR", "100"))
+MIN_BALANCE_ETH = float(os.getenv("MIN_BALANCE_ETH", "0.01"))
+
+# Logging
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+LOG_FILE = os.getenv("LOG_FILE", "logs/flasharb.log")
+TRADE_HISTORY_FILE = os.getenv("TRADE_HISTORY_FILE", "logs/trade_history.csv")
 
 # ============================================
-# Target Tokens - Base Mainnet
+# Target Tokens - Parse from env or use defaults
 # ============================================
 
-TARGET_TOKENS = [
-    {"symbol": "USDC", "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "decimals": 6},
-    {"symbol": "USDbC", "address": "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA", "decimals": 6},
-    {"symbol": "DAI", "address": "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb", "decimals": 18},
-    {"symbol": "cbETH", "address": "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22", "decimals": 18},
-    {"symbol": "wstETH", "address": "0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452", "decimals": 18},
-]
+def parse_target_tokens() -> list:
+    """Parse target tokens from environment variable."""
+    tokens_str = os.getenv("TARGET_TOKENS", "")
+    
+    if tokens_str:
+        tokens = []
+        for token_def in tokens_str.split(","):
+            parts = token_def.strip().split(":")
+            if len(parts) == 3:
+                tokens.append({
+                    "symbol": parts[0],
+                    "address": parts[1],
+                    "decimals": int(parts[2])
+                })
+        if tokens:
+            return tokens
+    
+    # Default tokens for Base Mainnet
+    return [
+        {"symbol": "USDC", "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "decimals": 6},
+        {"symbol": "USDbC", "address": "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA", "decimals": 6},
+        {"symbol": "DAI", "address": "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb", "decimals": 18},
+        {"symbol": "cbETH", "address": "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22", "decimals": 18},
+        {"symbol": "wstETH", "address": "0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452", "decimals": 18},
+    ]
+
+TARGET_TOKENS = parse_target_tokens()
 
 # ============================================
 # FlashBotV3 ABI
@@ -176,7 +232,7 @@ class FlashArbBot:
         
         # Connect to network
         print(f"\n🌐 Connecting to: {RPC_URL[:50]}...")
-        self.w3 = Web3(Web3.HTTPProvider(RPC_URL, request_kwargs={"timeout": 30}))
+        self.w3 = Web3(Web3.HTTPProvider(RPC_URL, request_kwargs={"timeout": RPC_TIMEOUT}))
         
         if not self.w3.is_connected():
             print("❌ Failed to connect")
@@ -230,13 +286,39 @@ class FlashArbBot:
         
         # Configuration summary
         print("\n" + "=" * 60)
-        print("Configuration")
+        print("⚙️  Configuration")
         print("=" * 60)
-        print(f"  Min Profit:      {MIN_PROFIT_ETH} ETH")
-        print(f"  Borrow Amount:   {BORROW_AMOUNT_ETH} ETH")
-        print(f"  Scan Interval:   {SCAN_INTERVAL}s")
-        print(f"  Dry Run:         {'Yes' if DRY_RUN else 'No'}")
-        print(f"  Pools Found:     {len(pools)}")
+        print(f"  Chain ID:           {CHAIN_ID}")
+        print(f"  Min Profit:         {MIN_PROFIT_ETH} ETH")
+        print(f"  Borrow Amount:      {BORROW_AMOUNT_ETH} ETH")
+        print(f"  Max Borrow:         {MAX_BORROW_ETH} ETH")
+        print(f"  Scan Interval:      {SCAN_INTERVAL}s")
+        print(f"  Max Gas:            {MAX_GAS_GWEI} gwei")
+        print(f"  Gas Limit:          {GAS_LIMIT}")
+        print(f"  Fee Tiers:          {FEE_TIERS_CONFIG}")
+        print(f"  Flash Fee Tier:     {FLASH_FEE_TIER} (0.{FLASH_FEE_TIER//10}%)")
+        print("=" * 60)
+        print("🔧 Modes")
+        print("=" * 60)
+        print(f"  Dry Run:            {'✅ Yes' if DRY_RUN else '❌ No (LIVE)'}")
+        print(f"  Debug Mode:         {'✅ On' if DEBUG_MODE else '❌ Off'}")
+        print(f"  Sniper Mode:        {'✅ On (×' + str(SNIPER_MODE_MULTIPLIER) + ')' if SNIPER_MODE_ENABLED else '❌ Off'}")
+        print(f"  Shadow Mode:        {'✅ On (' + str(SHADOW_SPREAD_THRESHOLD*100) + '%)' if SHADOW_MODE_ENABLED else '❌ Off'}")
+        print(f"  Latency Profiling:  {'✅ On' if LATENCY_PROFILING else '❌ Off'}")
+        print("=" * 60)
+        print("📊 Discovery")
+        print("=" * 60)
+        print(f"  Target Tokens:      {len(TARGET_TOKENS)}")
+        for token in TARGET_TOKENS:
+            print(f"    - {token['symbol']} ({token['decimals']} decimals)")
+        print(f"  Pools Found:        {len(pools)}")
+        print(f"  Min Liquidity:      {MIN_LIQUIDITY_ETH} ETH")
+        print("=" * 60)
+        print("🛡️ Safety Limits")
+        print("=" * 60)
+        print(f"  Max Failures:       {MAX_CONSECUTIVE_FAILURES}")
+        print(f"  Max TX/Hour:        {MAX_TX_PER_HOUR}")
+        print(f"  Min Balance:        {MIN_BALANCE_ETH} ETH")
         print("=" * 60)
         
         return True
@@ -299,7 +381,16 @@ class FlashArbBot:
             
             # Check minimum profit
             if opp.net_profit < MIN_PROFIT_WEI:
-                print(f"  ❌ Below minimum ({MIN_PROFIT_ETH} ETH)")
+                # Shadow Mode: Log near-miss opportunities
+                if SHADOW_MODE_ENABLED and opp.price_diff_pct >= SHADOW_SPREAD_THRESHOLD * 100:
+                    print(f"\n  👻 [SHADOW] Near-miss opportunity detected!")
+                    print(f"     Spread:        {opp.price_diff_pct:.4f}% ✓ (threshold: {SHADOW_SPREAD_THRESHOLD*100}%)")
+                    print(f"     Gross Profit:  {opp.expected_profit / 10**18:.6f} ETH")
+                    print(f"     Flash Fee:     {opp.flash_fee / 10**18:.6f} ETH")
+                    print(f"     Net Profit:    {opp.net_profit / 10**18:.6f} ETH ✗ (need: {MIN_PROFIT_ETH} ETH)")
+                    print(f"     Reason:        Flash loan fee exceeds spread benefit")
+                else:
+                    print(f"  ❌ Below minimum ({MIN_PROFIT_ETH} ETH)")
                 continue
             
             # Execute
