@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
-import "../interfaces/ISwaps.sol";
+import "../interfaces/IUniswapV3.sol";
 
 /**
  * @title SafeERC20

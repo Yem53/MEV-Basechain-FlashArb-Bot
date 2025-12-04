@@ -2,40 +2,55 @@
 pragma solidity ^0.8.19;
 
 /**
- * @title Uniswap V3 接口定义
- * @notice 用于 V3 闪电贷套利的完整接口
+ * @title Uniswap V3 Interface Definitions
+ * @notice Minimal interfaces for V3 Flash Loan Arbitrage
+ * @dev Base Mainnet specific
  */
 
 // ============================================
-// V3 Pool 接口
+// ERC20 Interface
+// ============================================
+
+interface IERC20 {
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function decimals() external view returns (uint8);
+    function symbol() external view returns (string memory);
+}
+
+// ============================================
+// Uniswap V3 Pool Interface
 // ============================================
 
 /**
- * @dev Uniswap V3 Pool 接口
- * @notice 核心 V3 池合约，提供闪电贷功能
+ * @dev Uniswap V3 Pool - Core trading and flash loan functionality
  */
 interface IUniswapV3Pool {
-    /// @notice 返回 token0 地址
+    /// @notice The first token of the pool (sorted by address)
     function token0() external view returns (address);
     
-    /// @notice 返回 token1 地址
+    /// @notice The second token of the pool
     function token1() external view returns (address);
     
-    /// @notice 返回池费率
+    /// @notice The pool's fee in hundredths of a bip (e.g., 3000 = 0.3%)
     function fee() external view returns (uint24);
     
-    /// @notice 返回当前流动性
+    /// @notice The current in-range liquidity
     function liquidity() external view returns (uint128);
     
     /**
-     * @notice 返回池的当前状态
-     * @return sqrtPriceX96 当前价格的平方根（Q64.96 格式）
-     * @return tick 当前 tick
-     * @return observationIndex 最近的观察索引
-     * @return observationCardinality 观察数组的大小
-     * @return observationCardinalityNext 下一个观察数组的大小
-     * @return feeProtocol 协议费率
-     * @return unlocked 池是否已解锁
+     * @notice The pool's current price state
+     * @return sqrtPriceX96 Current sqrt(price) as Q64.96
+     * @return tick Current tick
+     * @return observationIndex Most recent observation index
+     * @return observationCardinality Current observation array size
+     * @return observationCardinalityNext Next observation array size
+     * @return feeProtocol Protocol fee configuration
+     * @return unlocked Whether the pool is unlocked
      */
     function slot0() external view returns (
         uint160 sqrtPriceX96,
@@ -48,12 +63,11 @@ interface IUniswapV3Pool {
     );
     
     /**
-     * @notice 执行闪电贷
-     * @param recipient 接收借出代币的地址
-     * @param amount0 借出的 token0 数量
-     * @param amount1 借出的 token1 数量
-     * @param data 传递给回调的数据
-     * @dev 借出后必须在回调中偿还 amount + fee
+     * @notice Flash loan - borrow tokens and repay in same transaction
+     * @param recipient Address to receive the flash loaned tokens
+     * @param amount0 Amount of token0 to borrow
+     * @param amount1 Amount of token1 to borrow
+     * @param data Callback data passed to uniswapV3FlashCallback
      */
     function flash(
         address recipient,
@@ -61,66 +75,34 @@ interface IUniswapV3Pool {
         uint256 amount1,
         bytes calldata data
     ) external;
-    
-    /**
-     * @notice 执行 swap
-     * @param recipient 接收代币的地址
-     * @param zeroForOne 交易方向（true: token0 -> token1）
-     * @param amountSpecified 交易数量（正数: exactInput, 负数: exactOutput）
-     * @param sqrtPriceLimitX96 价格限制
-     * @param data 传递给回调的数据
-     */
-    function swap(
-        address recipient,
-        bool zeroForOne,
-        int256 amountSpecified,
-        uint160 sqrtPriceLimitX96,
-        bytes calldata data
-    ) external returns (int256 amount0, int256 amount1);
 }
 
 // ============================================
-// V3 Factory 接口
+// Uniswap V3 Factory Interface
 // ============================================
 
-/**
- * @dev Uniswap V3 Factory 接口
- */
 interface IUniswapV3Factory {
-    /// @notice 获取池地址
-    /// @param tokenA 代币 A
-    /// @param tokenB 代币 B
-    /// @param fee 费率
-    /// @return pool 池地址
+    /// @notice Get pool address for token pair and fee
     function getPool(
         address tokenA,
         address tokenB,
         uint24 fee
     ) external view returns (address pool);
-    
-    /// @notice 创建池
-    function createPool(
-        address tokenA,
-        address tokenB,
-        uint24 fee
-    ) external returns (address pool);
 }
 
 // ============================================
-// V3 Flash Callback 接口
+// Uniswap V3 Flash Callback Interface
 // ============================================
 
 /**
- * @dev V3 闪电贷回调接口
- * @notice 实现此接口以接收 V3 闪电贷回调
+ * @dev Required interface to receive V3 flash loans
  */
 interface IUniswapV3FlashCallback {
     /**
-     * @notice 闪电贷回调
-     * @param fee0 需要支付的 token0 费用
-     * @param fee1 需要支付的 token1 费用
-     * @param data 传递的自定义数据
-     * @dev 必须在此函数中偿还借款 + 费用
+     * @notice Called by the pool after a flash loan
+     * @param fee0 Fee owed for token0 borrow
+     * @param fee1 Fee owed for token1 borrow
+     * @param data Arbitrary data passed from flash() call
      */
     function uniswapV3FlashCallback(
         uint256 fee0,
@@ -130,38 +112,14 @@ interface IUniswapV3FlashCallback {
 }
 
 // ============================================
-// V3 Swap Callback 接口
+// Uniswap V3 SwapRouter Interface
 // ============================================
 
 /**
- * @dev V3 Swap 回调接口
- */
-interface IUniswapV3SwapCallback {
-    /**
-     * @notice Swap 回调
-     * @param amount0Delta token0 变化量（正数需支付）
-     * @param amount1Delta token1 变化量（正数需支付）
-     * @param data 传递的自定义数据
-     */
-    function uniswapV3SwapCallback(
-        int256 amount0Delta,
-        int256 amount1Delta,
-        bytes calldata data
-    ) external;
-}
-
-// ============================================
-// V3 SwapRouter 接口
-// ============================================
-
-/**
- * @dev Uniswap V3 SwapRouter02 接口
- * @notice Base Mainnet: 0x2626664c2603336E57B271c5C0b26F421741e481
+ * @dev SwapRouter02 for executing V3 swaps
+ * Base Mainnet: 0x2626664c2603336E57B271c5C0b26F421741e481
  */
 interface ISwapRouter {
-    /**
-     * @notice 精确输入单跳交换参数
-     */
     struct ExactInputSingleParams {
         address tokenIn;
         address tokenOut;
@@ -172,16 +130,11 @@ interface ISwapRouter {
         uint160 sqrtPriceLimitX96;
     }
     
-    /**
-     * @notice 执行精确输入单跳交换
-     */
+    /// @notice Swap exact input for maximum output (single hop)
     function exactInputSingle(
         ExactInputSingleParams calldata params
     ) external payable returns (uint256 amountOut);
     
-    /**
-     * @notice 精确输入多跳交换参数
-     */
     struct ExactInputParams {
         bytes path;
         address recipient;
@@ -189,58 +142,9 @@ interface ISwapRouter {
         uint256 amountOutMinimum;
     }
     
-    /**
-     * @notice 执行精确输入多跳交换
-     */
+    /// @notice Swap exact input for maximum output (multi hop)
     function exactInput(
         ExactInputParams calldata params
     ) external payable returns (uint256 amountOut);
-    
-    /**
-     * @notice 精确输出单跳交换参数
-     */
-    struct ExactOutputSingleParams {
-        address tokenIn;
-        address tokenOut;
-        uint24 fee;
-        address recipient;
-        uint256 amountOut;
-        uint256 amountInMaximum;
-        uint160 sqrtPriceLimitX96;
-    }
-    
-    /**
-     * @notice 执行精确输出单跳交换
-     */
-    function exactOutputSingle(
-        ExactOutputSingleParams calldata params
-    ) external payable returns (uint256 amountIn);
-}
-
-// ============================================
-// 辅助结构体
-// ============================================
-
-/**
- * @dev V3 池信息结构体
- */
-struct V3PoolInfo {
-    address pool;
-    address token0;
-    address token1;
-    uint24 fee;
-    uint160 sqrtPriceX96;
-    uint128 liquidity;
-}
-
-/**
- * @dev 闪电贷参数结构体
- */
-struct FlashParams {
-    address pool;           // V3 池地址
-    address tokenBorrow;    // 借入的代币
-    uint256 amountBorrow;   // 借入数量
-    address swapRouter;     // 用于套利的路由器
-    bytes swapData;         // 套利交易数据
 }
 

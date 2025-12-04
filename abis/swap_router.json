@@ -1,0 +1,42 @@
+[
+  {
+    "inputs": [
+      {
+        "components": [
+          {"name": "tokenIn", "type": "address"},
+          {"name": "tokenOut", "type": "address"},
+          {"name": "fee", "type": "uint24"},
+          {"name": "recipient", "type": "address"},
+          {"name": "amountIn", "type": "uint256"},
+          {"name": "amountOutMinimum", "type": "uint256"},
+          {"name": "sqrtPriceLimitX96", "type": "uint160"}
+        ],
+        "name": "params",
+        "type": "tuple"
+      }
+    ],
+    "name": "exactInputSingle",
+    "outputs": [{"name": "amountOut", "type": "uint256"}],
+    "stateMutability": "payable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "components": [
+          {"name": "path", "type": "bytes"},
+          {"name": "recipient", "type": "address"},
+          {"name": "amountIn", "type": "uint256"},
+          {"name": "amountOutMinimum", "type": "uint256"}
+        ],
+        "name": "params",
+        "type": "tuple"
+      }
+    ],
+    "name": "exactInput",
+    "outputs": [{"name": "amountOut", "type": "uint256"}],
+    "stateMutability": "payable",
+    "type": "function"
+  }
+]
+

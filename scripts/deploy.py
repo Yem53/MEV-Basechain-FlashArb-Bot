@@ -1,495 +1,326 @@
 #!/usr/bin/env python3
 """
-FlashBot 合约部署脚本
+FlashBotV3 Deployment Script
 
-功能：
-1. 编译 Solidity 合约
-2. 部署到指定网络
-3. 预授权路由器（无限授权）
-4. 保存部署信息到 deployments.json
+Pure V3 - no V2/Solidly legacy code.
 
-使用方法：
+Features:
+1. Compile FlashBotV3.sol
+2. Deploy to Base Mainnet
+3. Approve SwapRouter for tokens
+4. Save deployment to deployments.json
+
+Usage:
     python scripts/deploy.py
 
-环境变量（在 .env 文件中设置）：
-    PRIVATE_KEY: 部署账户私钥
-    RPC_URL: 网络 RPC 端点
+Environment Variables:
+    PRIVATE_KEY: Deployer private key
+    RPC_URL: Network RPC endpoint
 """
 
 import json
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from datetime import datetime
+from typing import Any, Dict
 
-# 添加项目根目录到路径
+# Project root
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from dotenv import load_dotenv
 from web3 import Web3
 
-# 加载环境变量
+# Load environment
 load_dotenv(PROJECT_ROOT / ".env")
 
-
 # ============================================
-# 网络配置（从环境变量加载）
+# V3 Constants - Base Mainnet
 # ============================================
 
-def get_network_config() -> dict:
-    """
-    从环境变量加载网络配置
-    
-    返回:
-        网络配置字典
-    """
-    return {
-        "name": os.getenv("NETWORK_NAME", "Base"),
-        "chain_id": int(os.getenv("CHAIN_ID", "8453")),
-        "weth": os.getenv("WETH_ADDRESS", "0x4200000000000000000000000000000000000006"),
-        "target_router": os.getenv("TARGET_ROUTER", "0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24"),
-    }
+V3_FACTORY = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD"
+SWAP_ROUTER = "0x2626664c2603336E57B271c5C0b26F421741e481"
+WETH = "0x4200000000000000000000000000000000000006"
 
+# Tokens to pre-approve
+TOKENS_TO_APPROVE = [
+    WETH,
+    "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",  # USDC
+    "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA",  # USDbC
+    "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb",  # DAI
+]
 
-# 延迟加载配置（在 main 中调用）
-NETWORK_CONFIG = None
-
-# 部署信息保存路径
 DEPLOYMENTS_FILE = PROJECT_ROOT / "deployments.json"
 
 
 # ============================================
-# Solidity 编译器
+# Solidity Compiler
 # ============================================
 
-def install_solc(version: str = "0.8.19") -> None:
-    """
-    安装指定版本的 Solidity 编译器
-    
-    参数:
-        version: Solidity 版本号
-    """
+def install_solc(version: str = "0.8.19"):
+    """Install Solidity compiler."""
     import solcx
     
-    print(f"📦 检查 Solidity 编译器 v{version}...")
+    print(f"📦 Checking solc v{version}...")
     
-    installed_versions = solcx.get_installed_solc_versions()
-    target_version = solcx.install.Version(version)
+    installed = solcx.get_installed_solc_versions()
+    target = solcx.install.Version(version)
     
-    if target_version not in installed_versions:
-        print(f"   正在安装 solc v{version}...")
+    if target not in installed:
+        print(f"   Installing solc v{version}...")
         solcx.install_solc(version)
-        print(f"   ✅ solc v{version} 安装完成")
+        print(f"   ✅ Installed")
     else:
-        print(f"   ✅ solc v{version} 已安装")
+        print(f"   ✅ Already installed")
     
     solcx.set_solc_version(version)
 
 
 def compile_contract() -> Dict[str, Any]:
-    """
-    编译 FlashBot 合约
-    
-    返回:
-        包含 abi 和 bytecode 的字典
-    """
+    """Compile FlashBotV3 contract."""
     import solcx
     
-    print("🔨 编译合约...")
+    print("🔨 Compiling FlashBotV3.sol...")
     
-    # 合约文件路径
     contracts_dir = PROJECT_ROOT / "contracts"
-    main_contract = contracts_dir / "FlashBot.sol"
+    main_contract = contracts_dir / "FlashBotV3.sol"
     
     if not main_contract.exists():
-        raise FileNotFoundError(f"合约文件不存在: {main_contract}")
+        raise FileNotFoundError(f"Contract not found: {main_contract}")
     
-    # 读取所有源文件
+    # Read all source files
     sources = {}
     
-    # 主合约
-    sources["FlashBot.sol"] = {
-        "content": main_contract.read_text(encoding="utf-8")
-    }
+    def read_sources(path: Path, base_path: Path):
+        for file in path.rglob("*.sol"):
+            rel_path = file.relative_to(base_path)
+            sources[str(rel_path)] = {"content": file.read_text(encoding="utf-8")}
     
-    # 接口文件
-    interfaces_dir = contracts_dir / "interfaces"
-    if interfaces_dir.exists():
-        for sol_file in interfaces_dir.glob("*.sol"):
-            rel_path = f"interfaces/{sol_file.name}"
-            sources[rel_path] = {
-                "content": sol_file.read_text(encoding="utf-8")
-            }
+    read_sources(contracts_dir, contracts_dir)
     
-    # 库文件
-    libraries_dir = contracts_dir / "libraries"
-    if libraries_dir.exists():
-        for sol_file in libraries_dir.glob("*.sol"):
-            rel_path = f"libraries/{sol_file.name}"
-            sources[rel_path] = {
-                "content": sol_file.read_text(encoding="utf-8")
-            }
-    
-    # 编译设置
-    compiler_input = {
+    # Compile
+    compiled = solcx.compile_standard({
         "language": "Solidity",
         "sources": sources,
         "settings": {
-            "optimizer": {
-                "enabled": True,
-                "runs": 10000
-            },
+            "optimizer": {"enabled": True, "runs": 200},
             "outputSelection": {
-                "*": {
-                    "*": ["abi", "evm.bytecode.object"]
-                }
+                "*": {"*": ["abi", "evm.bytecode.object"]}
             }
         }
-    }
+    }, allow_paths=[str(contracts_dir)])
     
-    # 编译
-    output = solcx.compile_standard(
-        compiler_input,
-        allow_paths=[str(contracts_dir)]
-    )
-    
-    # 检查编译错误
-    if "errors" in output:
-        for error in output["errors"]:
-            if error["severity"] == "error":
-                raise Exception(f"编译错误: {error['message']}")
-            else:
-                print(f"   ⚠️ 警告: {error['message']}")
-    
-    # 提取 FlashBot 合约
-    contract_data = output["contracts"]["FlashBot.sol"]["FlashBot"]
+    # Extract FlashBotV3
+    contract_data = compiled["contracts"]["FlashBotV3.sol"]["FlashBotV3"]
     
     abi = contract_data["abi"]
     bytecode = contract_data["evm"]["bytecode"]["object"]
     
-    print(f"   ✅ 编译成功")
-    print(f"   ABI 函数数量: {len([x for x in abi if x.get('type') == 'function'])}")
-    print(f"   Bytecode 大小: {len(bytecode) // 2} bytes")
+    print(f"   ✅ Compiled successfully")
+    print(f"   ABI functions: {len([x for x in abi if x.get('type') == 'function'])}")
+    print(f"   Bytecode size: {len(bytecode) // 2} bytes")
     
-    return {
-        "abi": abi,
-        "bytecode": bytecode
-    }
+    return {"abi": abi, "bytecode": bytecode}
 
 
 # ============================================
-# 部署函数
+# Deployment
 # ============================================
 
-def deploy_contract(
-    w3: Web3,
-    account: Any,
-    abi: list,
-    bytecode: str
-) -> str:
-    """
-    部署合约
+def deploy_contract(w3: Web3, account, abi: list, bytecode: str) -> str:
+    """Deploy contract to network."""
+    print("\n🚀 Deploying FlashBotV3...")
     
-    参数:
-        w3: Web3 实例
-        account: 账户对象
-        abi: 合约 ABI
-        bytecode: 合约字节码
-        
-    返回:
-        部署的合约地址
-    """
-    print("🚀 部署合约...")
-    
-    # 创建合约对象
     Contract = w3.eth.contract(abi=abi, bytecode=bytecode)
     
-    # 估算 gas
-    gas_estimate = Contract.constructor().estimate_gas({
-        "from": account.address
-    })
-    print(f"   预估 Gas: {gas_estimate:,}")
+    # Build transaction
+    nonce = w3.eth.get_transaction_count(account.address)
     
-    # 获取 gas 价格
-    gas_price = w3.eth.gas_price
-    print(f"   Gas 价格: {w3.from_wei(gas_price, 'gwei'):.4f} Gwei")
+    # Get gas params
+    try:
+        block = w3.eth.get_block("latest")
+        base_fee = block.get("baseFeePerGas")
+        
+        if base_fee:
+            priority_fee = w3.to_wei(0.01, "gwei")
+            max_fee = base_fee * 2 + priority_fee
+            gas_params = {
+                "maxFeePerGas": max_fee,
+                "maxPriorityFeePerGas": priority_fee
+            }
+        else:
+            gas_params = {"gasPrice": w3.eth.gas_price}
+    except Exception:
+        gas_params = {"gasPrice": w3.to_wei(0.01, "gwei")}
     
-    # 构建部署交易
     tx = Contract.constructor().build_transaction({
         "from": account.address,
-        "nonce": w3.eth.get_transaction_count(account.address),
-        "gas": int(gas_estimate * 1.2),  # 增加 20% 余量
-        "gasPrice": gas_price,
+        "nonce": nonce,
+        "gas": 3000000,
+        **gas_params
     })
     
-    # 签名并发送
-    signed_tx = account.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+    # Sign and send
+    signed = account.sign_transaction(tx)
     
-    print(f"   交易哈希: {tx_hash.hex()}")
-    print("   等待确认...")
+    # Extract raw bytes
+    raw_tx = None
+    if hasattr(signed, 'rawTransaction'):
+        raw_tx = signed.rawTransaction
+    elif hasattr(signed, 'raw_transaction'):
+        raw_tx = signed.raw_transaction
     
-    # 等待交易确认
+    tx_hash = w3.eth.send_raw_transaction(raw_tx)
+    print(f"   TX Hash: {tx_hash.hex()}")
+    
+    # Wait for receipt
+    print("   Waiting for confirmation...")
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
     
-    if receipt["status"] == 1:
-        contract_address = receipt["contractAddress"]
-        print(f"   ✅ 部署成功!")
-        print(f"   合约地址: {contract_address}")
-        print(f"   使用 Gas: {receipt['gasUsed']:,}")
-        return contract_address
-    else:
-        raise Exception("合约部署失败（交易 revert）")
+    if receipt["status"] != 1:
+        raise Exception("Deployment failed")
+    
+    contract_address = receipt["contractAddress"]
+    print(f"   ✅ Deployed at: {contract_address}")
+    print(f"   Gas used: {receipt['gasUsed']}")
+    
+    return contract_address
 
 
-def approve_router(
-    w3: Web3,
-    account: Any,
-    contract_address: str,
-    abi: list,
-    token_address: str,
-    router_address: str
-) -> bool:
-    """
-    预授权路由器使用代币（无限授权）
+def approve_tokens(w3: Web3, contract, account, tokens: list):
+    """Approve SwapRouter for tokens."""
+    print("\n🔓 Approving tokens for SwapRouter...")
     
-    参数:
-        w3: Web3 实例
-        account: 账户对象
-        contract_address: FlashBot 合约地址
-        abi: 合约 ABI
-        token_address: 代币地址
-        router_address: 路由器地址
-        
-    返回:
-        是否成功
-    """
-    # 转换为 checksum 地址
-    token_address = w3.to_checksum_address(token_address)
-    router_address = w3.to_checksum_address(router_address)
-    
-    print(f"🔓 预授权路由器...")
-    print(f"   代币: {token_address}")
-    print(f"   路由器: {router_address}")
-    
-    # 创建合约实例
-    contract = w3.eth.contract(address=contract_address, abi=abi)
-    
-    # 估算 gas
-    gas_estimate = contract.functions.approveRouter(
-        token_address,
-        router_address
-    ).estimate_gas({"from": account.address})
-    
-    # 构建交易 - 使用 'pending' 获取最新 nonce（包括待确认交易）
-    nonce = w3.eth.get_transaction_count(account.address, 'pending')
-    print(f"   当前 nonce: {nonce}")
-    
-    tx = contract.functions.approveRouter(
-        token_address,
-        router_address
-    ).build_transaction({
-        "from": account.address,
-        "nonce": nonce,
-        "gas": int(gas_estimate * 1.2),
-        "gasPrice": w3.eth.gas_price,
-    })
-    
-    # 签名并发送
-    signed_tx = account.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
-    
-    print(f"   交易哈希: {tx_hash.hex()}")
-    
-    # 等待确认
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
-    
-    if receipt["status"] == 1:
-        print(f"   ✅ 授权成功!")
-        return True
-    else:
-        print(f"   ❌ 授权失败")
-        return False
+    for token in tokens:
+        try:
+            print(f"   Approving {token[:10]}...")
+            
+            nonce = w3.eth.get_transaction_count(account.address, "pending")
+            
+            tx = contract.functions.approveToken(
+                w3.to_checksum_address(token)
+            ).build_transaction({
+                "from": account.address,
+                "nonce": nonce,
+                "gas": 100000,
+                "gasPrice": w3.eth.gas_price
+            })
+            
+            signed = account.sign_transaction(tx)
+            raw_tx = signed.rawTransaction if hasattr(signed, 'rawTransaction') else signed.raw_transaction
+            tx_hash = w3.eth.send_raw_transaction(raw_tx)
+            
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+            
+            if receipt["status"] == 1:
+                print(f"   ✅ Approved")
+            else:
+                print(f"   ❌ Failed")
+                
+        except Exception as e:
+            print(f"   ⚠️ Error: {e}")
 
 
-def save_deployment(
-    contract_address: str,
-    abi: list,
-    network_name: str,
-    chain_id: int,
-    deployer: str,
-    tx_hash: str = ""
-) -> None:
-    """
-    保存部署信息到 JSON 文件
+def save_deployment(chain_id: int, address: str, abi: list, deployer: str, tx_hash: str = ""):
+    """Save deployment info to JSON."""
+    print("\n💾 Saving deployment info...")
     
-    参数:
-        contract_address: 合约地址
-        abi: 合约 ABI
-        network_name: 网络名称
-        chain_id: 链 ID
-        deployer: 部署者地址
-        tx_hash: 部署交易哈希
-    """
-    import datetime
+    deployments = {}
+    if DEPLOYMENTS_FILE.exists():
+        deployments = json.loads(DEPLOYMENTS_FILE.read_text())
     
-    deployment_info = {
-        "contract_address": contract_address,
-        "network": network_name,
+    deployments[str(chain_id)] = {
+        "contract_address": address,
+        "contract_name": "FlashBotV3",
+        "network": "Base Mainnet",
         "chain_id": chain_id,
         "deployer": deployer,
-        "deployed_at": datetime.datetime.now().isoformat(),
+        "deployed_at": datetime.now().isoformat(),
         "tx_hash": tx_hash,
+        "v3_constants": {
+            "factory": V3_FACTORY,
+            "swap_router": SWAP_ROUTER,
+            "weth": WETH
+        },
         "abi": abi
     }
     
-    # 读取现有部署信息
-    deployments = {}
-    if DEPLOYMENTS_FILE.exists():
-        try:
-            deployments = json.loads(DEPLOYMENTS_FILE.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            deployments = {}
-    
-    # 按链 ID 存储
-    deployments[str(chain_id)] = deployment_info
-    
-    # 保存
-    DEPLOYMENTS_FILE.write_text(
-        json.dumps(deployments, indent=2, ensure_ascii=False),
-        encoding="utf-8"
-    )
-    
-    print(f"💾 部署信息已保存到: {DEPLOYMENTS_FILE}")
+    DEPLOYMENTS_FILE.write_text(json.dumps(deployments, indent=2))
+    print(f"   ✅ Saved to {DEPLOYMENTS_FILE}")
 
 
 # ============================================
-# 主函数
+# Main
 # ============================================
 
 def main():
-    """主部署流程"""
-    
     print("\n" + "=" * 60)
-    print("🤖 FlashBot 合约部署脚本")
-    print("=" * 60 + "\n")
+    print("     🚀 FlashBotV3 Deployment - Pure V3")
+    print("=" * 60)
     
-    # ===== 1. 检查环境变量 =====
-    private_key = os.getenv("PRIVATE_KEY")
+    # Get configuration
     rpc_url = os.getenv("RPC_URL")
+    private_key = os.getenv("PRIVATE_KEY")
     
-    if not private_key:
-        print("❌ 错误: 未设置 PRIVATE_KEY 环境变量")
-        print("   请在 .env 文件中添加: PRIVATE_KEY=你的私钥")
+    if not rpc_url or not private_key:
+        print("❌ Missing RPC_URL or PRIVATE_KEY in .env")
         sys.exit(1)
     
-    if not rpc_url:
-        print("❌ 错误: 未设置 RPC_URL 环境变量")
-        print("   请在 .env 文件中添加: RPC_URL=https://sepolia.base.org")
-        sys.exit(1)
-    
-    # ===== 2. 连接网络 =====
-    print("🌐 连接网络...")
-    w3 = Web3(Web3.HTTPProvider(rpc_url))
+    # Connect
+    print(f"\n🌐 Connecting to network...")
+    w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 30}))
     
     if not w3.is_connected():
-        print("❌ 无法连接到网络")
+        print("❌ Failed to connect")
         sys.exit(1)
     
     chain_id = w3.eth.chain_id
-    print(f"   ✅ 已连接")
-    print(f"   链 ID: {chain_id}")
-    print(f"   RPC: {rpc_url[:50]}...")
+    print(f"   ✅ Connected, Chain ID: {chain_id}")
     
-    # ===== 3. 加载账户 =====
-    print("\n👛 加载账户...")
-    
-    # 确保私钥格式正确
+    # Load account
+    from eth_account import Account
     if not private_key.startswith("0x"):
         private_key = "0x" + private_key
+    account = Account.from_key(private_key)
     
-    account = w3.eth.account.from_key(private_key)
     balance = w3.eth.get_balance(account.address)
+    print(f"   Deployer: {account.address}")
+    print(f"   Balance: {balance / 10**18:.4f} ETH")
     
-    print(f"   地址: {account.address}")
-    print(f"   余额: {w3.from_wei(balance, 'ether'):.6f} ETH")
-    
-    if balance == 0:
-        print("   ⚠️ 警告: 账户余额为 0，无法部署")
+    if balance < w3.to_wei(0.01, "ether"):
+        print("❌ Insufficient balance for deployment")
         sys.exit(1)
     
-    # ===== 4. 安装编译器并编译 =====
-    print()
-    install_solc("0.8.19")
-    
-    print()
+    # Compile
+    install_solc()
     compiled = compile_contract()
     
-    # ===== 5. 部署合约 =====
-    print()
-    contract_address = deploy_contract(
-        w3, account, 
-        compiled["abi"], 
-        compiled["bytecode"]
+    # Deploy
+    contract_address = deploy_contract(w3, account, compiled["abi"], compiled["bytecode"])
+    
+    # Load deployed contract
+    contract = w3.eth.contract(
+        address=w3.to_checksum_address(contract_address),
+        abi=compiled["abi"]
     )
     
-    # ===== 6. 加载网络配置并预授权路由器 =====
-    print()
+    # Approve tokens
+    approve_tokens(w3, contract, account, TOKENS_TO_APPROVE)
     
-    # 从环境变量加载网络配置
-    network_config = get_network_config()
-    weth = network_config["weth"]
-    router = network_config["target_router"]
+    # Save deployment
+    save_deployment(chain_id, contract_address, compiled["abi"], account.address)
     
-    print(f"📋 网络配置:")
-    print(f"   WETH: {weth}")
-    print(f"   目标路由器: {router}")
-    print()
-    
-    # 授权 WETH
-    approve_router(
-        w3, account,
-        contract_address,
-        compiled["abi"],
-        weth,
-        router
-    )
-    
-    # ===== 7. 保存部署信息 =====
-    print()
-    save_deployment(
-        contract_address=contract_address,
-        abi=compiled["abi"],
-        network_name=network_config["name"],
-        chain_id=chain_id,
-        deployer=account.address
-    )
-    
-    # ===== 完成 =====
     print("\n" + "=" * 60)
-    print("🎉 部署完成!")
+    print("✅ Deployment Complete!")
     print("=" * 60)
-    print(f"\n📋 部署摘要:")
-    print(f"   合约地址: {contract_address}")
-    print(f"   网络: {network_config['name']}")
-    print(f"   链 ID: {chain_id}")
-    print(f"   部署者: {account.address}")
-    print(f"\n📝 下一步:")
-    print(f"   运行测试: python scripts/test_flash.py")
-    print()
+    print(f"   Contract: {contract_address}")
+    print(f"   Network:  Base Mainnet (Chain {chain_id})")
+    print("\nNext steps:")
+    print("   1. Update FLASHBOT_ADDRESS in .env")
+    print("   2. Run: python main.py")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n\n⚠️ 用户取消操作")
-        sys.exit(1)
-    except Exception as e:
-        print(f"\n❌ 错误: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
-
-
+    main()
