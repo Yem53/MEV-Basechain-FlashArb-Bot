@@ -1,72 +1,108 @@
 # ============================================
-# FlashArb-Core Dependencies
+# FlashArb V3 - Complete Dependencies
 # Python 3.10+ required
 # ============================================
+# 
+# Install: pip install -r requirements.txt
+# 
+# ============================================
 
-# --------------------------------------------
-# Core: Web3 and Ethereum
-# --------------------------------------------
-web3>=6.0.0,<7.0.0
-eth-abi>=5.0.0
-eth-account>=0.11.0
-eth-typing>=4.0.0
-eth-utils>=4.0.0
-hexbytes>=1.0.0
+# ============================================
+# CORE: Web3 & Ethereum (Required)
+# ============================================
+web3>=6.0.0,<7.0.0          # Ethereum interaction
+eth-abi>=5.0.0              # ABI encoding/decoding
+eth-account>=0.11.0         # Account management & signing
+eth-typing>=4.0.0           # Ethereum type definitions
+eth-utils>=4.0.0            # Ethereum utilities
+hexbytes>=1.0.0             # Hex byte handling
 
-# --------------------------------------------
-# Async HTTP Client
-# --------------------------------------------
-aiohttp>=3.9.0
-aiohttp-socks>=0.8.0  # For proxy support (optional)
+# ============================================
+# NETWORK: HTTP Clients (Required)
+# ============================================
+requests>=2.31.0            # Sync HTTP client
+urllib3>=2.0.0              # HTTP connection pooling
+aiohttp>=3.9.0              # Async HTTP client
+aiohttp-socks>=0.8.0        # Proxy support (optional)
 
-# --------------------------------------------
-# Environment & Configuration
-# --------------------------------------------
-python-dotenv>=1.0.0
-pydantic>=2.0.0  # For config validation (optional)
+# ============================================
+# CONFIG: Environment & Validation (Required)
+# ============================================
+python-dotenv>=1.0.0        # .env file loading
+pydantic>=2.0.0             # Config validation
 
-# --------------------------------------------
-# Solidity Compiler (for contract deployment)
-# --------------------------------------------
-py-solc-x>=2.0.0
+# ============================================
+# SOLIDITY: Contract Compilation (Required for deploy)
+# ============================================
+py-solc-x>=2.0.0            # Solidity compiler management
 
-# --------------------------------------------
-# Data Analysis & Visualization
-# --------------------------------------------
-pandas>=2.0.0
-tabulate>=0.9.0
-numpy>=1.24.0
+# ============================================
+# DATA: Analysis & Display (Required)
+# ============================================
+pandas>=2.0.0               # Data analysis
+numpy>=1.24.0               # Numerical computing
+tabulate>=0.9.0             # Table formatting
 
-# --------------------------------------------
-# Logging & Monitoring
-# --------------------------------------------
-structlog>=23.0.0
-rich>=13.0.0  # Beautiful terminal output
+# ============================================
+# UI: Terminal Output (Recommended)
+# ============================================
+rich>=13.0.0                # Beautiful terminal output (market_screener)
 
-# --------------------------------------------
-# Build Tools & Utilities
-# --------------------------------------------
+# ============================================
+# PERFORMANCE: Speed Optimizations (Recommended)
+# ============================================
+orjson>=3.9.0               # Fast JSON (10x faster than stdlib)
+
+# ============================================
+# LOGGING: Structured Logging (Optional)
+# ============================================
+structlog>=23.0.0           # Structured logging
+
+# ============================================
+# TYPING: Type Hints Support
+# ============================================
+typing-extensions>=4.0.0    # Extended type hints
+
+# ============================================
+# BUILD: Package Tools
+# ============================================
 setuptools>=65.0.0
 wheel>=0.42.0
-typing-extensions>=4.0.0
 
-# --------------------------------------------
-# JSON & Data Validation
-# --------------------------------------------
-jsonschema>=4.0.0
-orjson>=3.9.0  # Fast JSON parsing (10x faster than stdlib)
+# ============================================
+# VALIDATION: JSON Schema (Optional)
+# ============================================
+jsonschema>=4.0.0           # JSON validation
 
-# --------------------------------------------
-# AWS Deployment (Optional - for cloud)
-# --------------------------------------------
-# boto3>=1.34.0  # AWS SDK (uncomment if needed)
-# python-telegram-bot>=20.0  # Telegram alerts (optional)
+# ============================================
+# OPTIONAL: Cloud & Alerts
+# ============================================
+# boto3>=1.34.0             # AWS SDK (uncomment for cloud deploy)
+# python-telegram-bot>=20.0 # Telegram alerts (uncomment for notifications)
 
-# --------------------------------------------
-# Development & Testing (Optional)
-# --------------------------------------------
-# pytest>=7.0.0
-# pytest-asyncio>=0.21.0
-# black>=23.0.0
-# flake8>=6.0.0
+# ============================================
+# DEVELOPMENT: Testing & Linting (Optional)
+# ============================================
+# pytest>=7.0.0             # Testing framework
+# pytest-asyncio>=0.21.0    # Async test support
+# black>=23.0.0             # Code formatter
+# flake8>=6.0.0             # Linter
+# mypy>=1.0.0               # Type checker
 
+
+# ============================================
+# QUICK INSTALL SUMMARY
+# ============================================
+# 
+# Minimum (Core Only):
+#   pip install web3 eth-abi eth-account python-dotenv requests aiohttp tabulate
+#
+# Recommended (Full Features):
+#   pip install -r requirements.txt
+#
+# With Optional Speed:
+#   pip install orjson rich
+#
+# For Development:
+#   pip install pytest pytest-asyncio black flake8
+#

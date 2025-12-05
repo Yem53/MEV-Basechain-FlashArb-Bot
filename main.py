@@ -111,36 +111,69 @@ LOG_FILE = os.getenv("LOG_FILE", "logs/flasharb.log")
 TRADE_HISTORY_FILE = os.getenv("TRADE_HISTORY_FILE", "logs/trade_history.csv")
 
 # ============================================
-# Target Tokens - Parse from env or use defaults
+# Target Tokens - Load from config file or env
 # ============================================
 
-def parse_target_tokens() -> list:
-    """Parse target tokens from environment variable."""
-    tokens_str = os.getenv("TARGET_TOKENS", "")
+def load_target_tokens() -> list:
+    """
+    Load target tokens with priority:
+    1. config/target_tokens.py (full config with fee_tiers, min_profit)
+    2. .env TARGET_TOKENS variable (simple format: SYMBOL:ADDRESS:DECIMALS)
+    3. Default hardcoded tokens
+    """
+    # Priority 1: Try to import from config file
+    try:
+        from config.target_tokens import TARGET_TOKENS as CONFIG_TOKENS
+        if CONFIG_TOKENS:
+            print(f"📋 Loaded {len(CONFIG_TOKENS)} tokens from config/target_tokens.py")
+            return CONFIG_TOKENS
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"⚠️ Error loading config/target_tokens.py: {e}")
     
+    # Priority 2: Parse from .env (simple format)
+    tokens_str = os.getenv("TARGET_TOKENS", "")
     if tokens_str:
         tokens = []
         for token_def in tokens_str.split(","):
             parts = token_def.strip().split(":")
-            if len(parts) == 3:
-                tokens.append({
+            if len(parts) >= 3:
+                token = {
                     "symbol": parts[0],
                     "address": parts[1],
-                    "decimals": int(parts[2])
-                })
+                    "decimals": int(parts[2]),
+                    "fee_tiers": FEE_TIERS_CONFIG,  # Use global fee tiers
+                    "min_profit": MIN_PROFIT_ETH,   # Use global min profit
+                }
+                # Optional: parse fee_tiers if provided (format: SYMBOL:ADDR:DEC:500-3000-10000)
+                if len(parts) >= 4:
+                    try:
+                        token["fee_tiers"] = [int(f) for f in parts[3].split("-")]
+                    except:
+                        pass
+                # Optional: parse min_profit if provided
+                if len(parts) >= 5:
+                    try:
+                        token["min_profit"] = float(parts[4])
+                    except:
+                        pass
+                tokens.append(token)
         if tokens:
+            print(f"📋 Loaded {len(tokens)} tokens from .env TARGET_TOKENS")
             return tokens
     
-    # Default tokens for Base Mainnet
+    # Priority 3: Default tokens for Base Mainnet
+    print("📋 Using default token list")
     return [
-        {"symbol": "USDC", "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "decimals": 6},
-        {"symbol": "USDbC", "address": "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA", "decimals": 6},
-        {"symbol": "DAI", "address": "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb", "decimals": 18},
-        {"symbol": "cbETH", "address": "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22", "decimals": 18},
-        {"symbol": "wstETH", "address": "0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452", "decimals": 18},
+        {"symbol": "USDC", "address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "decimals": 6, "fee_tiers": [500, 3000], "min_profit": 0.0005},
+        {"symbol": "USDbC", "address": "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA", "decimals": 6, "fee_tiers": [500, 3000], "min_profit": 0.0005},
+        {"symbol": "DAI", "address": "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb", "decimals": 18, "fee_tiers": [500, 3000], "min_profit": 0.0005},
+        {"symbol": "cbETH", "address": "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22", "decimals": 18, "fee_tiers": [500, 3000], "min_profit": 0.001},
+        {"symbol": "wstETH", "address": "0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452", "decimals": 18, "fee_tiers": [500, 3000], "min_profit": 0.001},
     ]
 
-TARGET_TOKENS = parse_target_tokens()
+TARGET_TOKENS = load_target_tokens()
 
 # ============================================
 # FlashBotV3 ABI
@@ -372,7 +405,7 @@ class FlashArbBot:
         print(f"  Max Gas:            {MAX_GAS_GWEI} gwei")
         print(f"  Gas Limit:          {GAS_LIMIT}")
         print(f"  Fee Tiers:          {FEE_TIERS_CONFIG}")
-        print(f"  Flash Fee Tier:     {FLASH_FEE_TIER} (0.{FLASH_FEE_TIER//10}%)")
+        print(f"  Flash Fee Tier:     {FLASH_FEE_TIER} ({FLASH_FEE_TIER/10000:.2f}%)")  # 500=0.05%, 3000=0.30%, 10000=1.00%
         print("=" * 60)
         print("🔧 Modes")
         print("=" * 60)

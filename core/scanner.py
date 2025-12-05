@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Uniswap V3 Arbitrage Scanner - HIGH PERFORMANCE VERSION (HARDENED)
+Uniswap V3 Arbitrage Scanner - HIGH PERFORMANCE VERSION
 
 ⚡ Zero-Latency Optimizations:
 1. Super-Batch Scanning: ONE Multicall per scan cycle
@@ -9,11 +9,6 @@ Uniswap V3 Arbitrage Scanner - HIGH PERFORMANCE VERSION (HARDENED)
 4. Local-only math (no RPC in calculations)
 5. orjson for fast JSON parsing (if available)
 
-🛡️ Safety Layers (Pitfall 4):
-- Stale RPC data detection
-- Block number verification
-- Skip cycles with outdated data
-
 Base Mainnet Constants:
 - V3 Factory: 0x33128a8fC17869897dcE68Ed026d694621f6FDfD
 - Init Code Hash: 0xe34f199b19b2b4f47f68442619d555527d244f78a3297ea89325f843f87b8b54
@@ -21,15 +16,11 @@ Base Mainnet Constants:
 
 import os
 import time
-import logging
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 
 from web3 import Web3
 from eth_abi import encode, decode
-
-# Setup logger
-logger = logging.getLogger(__name__)
 
 # Try to import orjson for faster JSON parsing (10x faster than stdlib)
 try:
@@ -276,14 +267,8 @@ class V3Scanner:
         # Multicall3 contract (cached)
         self._multicall_contract = None
         
-        # 🛡️ Pitfall 4: Stale RPC Data Detection
-        self._last_seen_block: int = 0
-        self._stale_data_count: int = 0
-        self._max_stale_tolerance: int = 3  # Max consecutive stale cycles
-        
         # Stats
         self.scan_count = 0
-        self.stale_skip_count = 0
     
     def _get_multicall_contract(self):
         """Get or create cached Multicall3 contract."""
@@ -404,25 +389,17 @@ class V3Scanner:
         
         return discovered
     
-    def update_pool_data(self) -> Tuple[bool, float, int, int]:
+    def update_pool_data(self) -> Tuple[bool, float, int]:
         """
         Super-Batch update: ONE Multicall for ALL pools.
         
         ⚡ Uses pre-encoded calldata - zero encoding overhead.
-        🛡️ Includes block number check for stale data detection.
-        
-        Returns:
-            (success, network_ms, updated_count, block_number)
         """
         if not self._multicall_batch or not self.pool_list:
-            return False, 0.0, 0, 0
+            return False, 0.0, 0
         
         try:
             t_start = time.time()
-            
-            # 🛡️ Pitfall 4: Get current block number BEFORE multicall
-            # This ensures we know which block the data is from
-            current_block = self.w3.eth.block_number
             
             # Execute pre-encoded Multicall
             multicall = self._get_multicall_contract()
@@ -431,32 +408,6 @@ class V3Scanner:
             ).call()
             
             network_ms = (time.time() - t_start) * 1000
-            
-            # 🛡️ Stale Data Check
-            if current_block <= self._last_seen_block:
-                self._stale_data_count += 1
-                self.stale_skip_count += 1
-                
-                if self._stale_data_count <= self._max_stale_tolerance:
-                    logger.warning(
-                        f"[WARN] Stale Data detected: block {current_block} <= last seen {self._last_seen_block} "
-                        f"(count: {self._stale_data_count}/{self._max_stale_tolerance})"
-                    )
-                    # Return early - don't process stale data
-                    return False, network_ms, 0, current_block
-                else:
-                    # Too many stale cycles - might be RPC sync issue
-                    logger.error(
-                        f"[ERROR] Persistent stale data ({self._stale_data_count}x). "
-                        "RPC might be out of sync."
-                    )
-                    # Reset counter but still skip this cycle
-                    self._stale_data_count = 0
-                    return False, network_ms, 0, current_block
-            
-            # Reset stale counter on fresh data
-            self._stale_data_count = 0
-            self._last_seen_block = current_block
             
             # Parse results (optimized loop)
             success_count = 0
@@ -494,7 +445,7 @@ class V3Scanner:
                 
                 pool.last_update = now
             
-            return success_count > 0, network_ms, success_count, current_block
+            return success_count > 0, network_ms, success_count
             
         except Exception as e:
             if DEBUG_MODE:
@@ -657,23 +608,11 @@ class V3Scanner:
         Execute one scan cycle.
         
         ⚡ Performance: 1 RPC call + local calculations only.
-        🛡️ Includes stale data detection (Pitfall 4).
         """
         # Single network request for ALL pool data
-        result = self.update_pool_data()
-        
-        # Handle both old (3-tuple) and new (4-tuple) return format
-        if len(result) == 4:
-            success, network_ms, updated, block_num = result
-        else:
-            success, network_ms, updated = result
-            block_num = 0
+        success, network_ms, updated = self.update_pool_data()
         
         if not success:
-            # Log if this was due to stale data
-            if self._stale_data_count > 0:
-                logger.debug(f"Skipping cycle - stale data (block: {block_num})")
-            
             return ScanResult(
                 pools_scanned=len(self.pool_list),
                 time_network_ms=network_ms
