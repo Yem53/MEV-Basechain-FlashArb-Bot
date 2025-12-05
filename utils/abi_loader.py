@@ -3,12 +3,39 @@ FlashArb-Core ABI 加载器
 
 用于从本地文件加载和缓存合约 ABI 的工具模块。
 支持单个 ABI 加载和带缓存的批量加载。
+
+⚡ 高性能优化:
+- 使用 orjson 进行快速 JSON 解析 (10x faster)
 """
 
 import json
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
+
+# Try to import orjson for faster JSON parsing
+try:
+    import orjson
+    HAS_ORJSON = True
+except ImportError:
+    HAS_ORJSON = False
+
+
+def _json_loads(data: bytes) -> Any:
+    """Fast JSON loading with orjson fallback to stdlib json."""
+    if HAS_ORJSON:
+        return orjson.loads(data)
+    return json.loads(data)
+
+
+def _json_load_file(file_path: Path) -> Any:
+    """Load JSON from file using fastest available method."""
+    if HAS_ORJSON:
+        with open(file_path, "rb") as f:  # orjson works with bytes
+            return orjson.loads(f.read())
+    else:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return json.load(f)
 
 
 class ABILoadError(Exception):
@@ -115,9 +142,8 @@ def load_abi(
         )
     
     try:
-        with open(abi_path, "r", encoding="utf-8") as f:
-            content = json.load(f)
-    except json.JSONDecodeError as e:
+        content = _json_load_file(abi_path)
+    except (json.JSONDecodeError, ValueError) as e:
         raise ABILoadError(f"{abi_path} 中的 JSON 格式无效: {e}")
     except Exception as e:
         raise ABILoadError(f"读取 {abi_path} 失败: {e}")
@@ -129,7 +155,10 @@ def load_abi(
             abi = content["abi"]
         elif "result" in content:
             # Etherscan 格式
-            abi = json.loads(content["result"]) if isinstance(content["result"], str) else content["result"]
+            if isinstance(content["result"], str):
+                abi = _json_loads(content["result"].encode()) if HAS_ORJSON else json.loads(content["result"])
+            else:
+                abi = content["result"]
         else:
             raise ABILoadError(
                 f"{file_name} 中的 ABI 格式意外。"

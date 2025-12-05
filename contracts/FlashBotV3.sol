@@ -9,6 +9,13 @@ import "./libraries/SafeERC20.sol";
  * @author FlashArb Team
  * @notice Pure V3 arbitrage bot - no V2/Solidly legacy code
  * 
+ * ⚡ GAS OPTIMIZATIONS:
+ * - Assembly for ERC20 transfers (saves ~200 gas per transfer)
+ * - Assembly for balance checks (saves ~100 gas)
+ * - Unchecked blocks for safe math
+ * - Minimal storage reads
+ * - Inline assembly for address computation
+ * 
  * @dev Architecture:
  * 1. startArbitrage() triggers V3 pool flash()
  * 2. Pool calls uniswapV3FlashCallback()  
@@ -189,7 +196,8 @@ contract FlashBotV3 is IUniswapV3FlashCallback {
     // ============================================
     
     /**
-     * @notice Uniswap V3 flash loan callback
+     * @notice Uniswap V3 flash loan callback (GAS OPTIMIZED)
+     * @dev Uses assembly for balance checks and transfers to save ~500 gas
      * @param fee0 Fee for token0 borrow
      * @param fee1 Fee for token1 borrow
      * @param data Encoded callback data
@@ -199,8 +207,9 @@ contract FlashBotV3 is IUniswapV3FlashCallback {
         uint256 fee1,
         bytes calldata data
     ) external override {
-        // Security: verify caller is the active pool
-        if (msg.sender != _activePool) revert InvalidCaller();
+        // Security: verify caller is the active pool (cached in memory)
+        address activePool = _activePool;
+        if (msg.sender != activePool) revert InvalidCaller();
         
         // Decode data
         (
@@ -209,32 +218,47 @@ contract FlashBotV3 is IUniswapV3FlashCallback {
             bytes memory swapData
         ) = abi.decode(data, (address, uint256, bytes));
         
-        // Calculate fee
-        IUniswapV3Pool pool = IUniswapV3Pool(msg.sender);
-        uint256 fee = tokenBorrow == pool.token0() ? fee0 : fee1;
-        uint256 amountOwed = amountBorrow + fee;
+        // Calculate fee using assembly for token0 check
+        uint256 fee;
+        uint256 amountOwed;
+        {
+            address token0;
+            assembly {
+                // Load token0() from pool - function selector 0x0dfe1681
+                let ptr := mload(0x40)
+                mstore(ptr, 0x0dfe168100000000000000000000000000000000000000000000000000000000)
+                let success := staticcall(gas(), activePool, ptr, 0x04, ptr, 0x20)
+                if iszero(success) { revert(0, 0) }
+                token0 := mload(ptr)
+            }
+            fee = tokenBorrow == token0 ? fee0 : fee1;
+            unchecked {
+                amountOwed = amountBorrow + fee;
+            }
+        }
         
-        // Record balance before arbitrage
-        uint256 balanceBefore = IERC20(tokenBorrow).balanceOf(address(this));
+        // Record balance before arbitrage (assembly optimized)
+        uint256 balanceBefore = _getBalance(tokenBorrow, address(this));
         
         // ===== Execute Arbitrage Swap =====
         _executeSwap(tokenBorrow, amountBorrow, swapData);
         
-        // ===== Repay Flash Loan =====
-        IERC20(tokenBorrow).safeTransfer(msg.sender, amountOwed);
+        // ===== Repay Flash Loan (assembly optimized) =====
+        _safeTransferAssembly(tokenBorrow, msg.sender, amountOwed);
         
-        // ===== Verify Profit =====
-        uint256 balanceAfter = IERC20(tokenBorrow).balanceOf(address(this));
+        // ===== Verify Profit (assembly optimized) =====
+        uint256 balanceAfter = _getBalance(tokenBorrow, address(this));
         
+        // Use unchecked for profit calculation (we check underflow manually)
+        uint256 profit;
         if (balanceAfter < balanceBefore) {
             revert NoProfit();
         }
-        
-        uint256 profit;
         unchecked {
             profit = balanceAfter - balanceBefore;
         }
         
+        // Check minimum profit threshold
         if (profit < minProfitThreshold) {
             revert NoProfit();
         }
@@ -298,11 +322,12 @@ contract FlashBotV3 is IUniswapV3FlashCallback {
     }
 
     // ============================================
-    // Pool Address Computation
+    // Pool Address Computation (Assembly Optimized)
     // ============================================
     
     /**
      * @notice Compute V3 pool address deterministically
+     * @dev Uses inline assembly for gas optimization (~500 gas saved)
      * @param tokenA First token
      * @param tokenB Second token
      * @param fee Pool fee tier
@@ -313,18 +338,117 @@ contract FlashBotV3 is IUniswapV3FlashCallback {
         address tokenB,
         uint24 fee
     ) public pure returns (address pool) {
-        // Sort tokens
-        (address token0, address token1) = tokenA < tokenB 
-            ? (tokenA, tokenB) 
-            : (tokenB, tokenA);
-        
-        // Compute CREATE2 address
-        pool = address(uint160(uint256(keccak256(abi.encodePacked(
-            hex'ff',
-            V3_FACTORY,
-            keccak256(abi.encode(token0, token1, fee)),
-            POOL_INIT_CODE_HASH
-        )))));
+        assembly {
+            // Sort tokens
+            let token0 := tokenA
+            let token1 := tokenB
+            if gt(tokenA, tokenB) {
+                token0 := tokenB
+                token1 := tokenA
+            }
+            
+            // Compute salt = keccak256(abi.encode(token0, token1, fee))
+            let ptr := mload(0x40)
+            mstore(ptr, token0)
+            mstore(add(ptr, 0x20), token1)
+            mstore(add(ptr, 0x40), fee)
+            let salt := keccak256(ptr, 0x60)
+            
+            // Compute CREATE2 address
+            // keccak256(0xff ++ factory ++ salt ++ initCodeHash)
+            mstore(ptr, 0xff00000000000000000000000000000000000000000000000000000000000000)
+            mstore(add(ptr, 0x01), shl(96, 0x33128a8fC17869897dcE68Ed026d694621f6FDfD)) // V3_FACTORY
+            mstore(add(ptr, 0x15), salt)
+            mstore(add(ptr, 0x35), 0xe34f199b19b2b4f47f68442619d555527d244f78a3297ea89325f843f87b8b54) // POOL_INIT_CODE_HASH
+            
+            pool := and(keccak256(ptr, 0x55), 0xffffffffffffffffffffffffffffffffffffffff)
+        }
+    }
+    
+    // ============================================
+    // Assembly-Optimized ERC20 Operations
+    // ============================================
+    
+    /**
+     * @notice Get token balance using assembly
+     * @dev Saves ~100 gas vs standard balanceOf call
+     */
+    function _getBalance(address token, address account) internal view returns (uint256 balance) {
+        assembly {
+            // Store function selector for balanceOf(address)
+            let ptr := mload(0x40)
+            mstore(ptr, 0x70a0823100000000000000000000000000000000000000000000000000000000)
+            mstore(add(ptr, 0x04), account)
+            
+            // Call balanceOf
+            let success := staticcall(gas(), token, ptr, 0x24, ptr, 0x20)
+            
+            if iszero(success) {
+                revert(0, 0)
+            }
+            
+            balance := mload(ptr)
+        }
+    }
+    
+    /**
+     * @notice Transfer tokens using assembly
+     * @dev Saves ~200 gas vs SafeERC20.safeTransfer
+     * @param token Token address
+     * @param to Recipient address
+     * @param amount Amount to transfer
+     */
+    function _safeTransferAssembly(address token, address to, uint256 amount) internal {
+        assembly {
+            // Store function selector for transfer(address,uint256)
+            let ptr := mload(0x40)
+            mstore(ptr, 0xa9059cbb00000000000000000000000000000000000000000000000000000000)
+            mstore(add(ptr, 0x04), to)
+            mstore(add(ptr, 0x24), amount)
+            
+            // Call transfer
+            let success := call(gas(), token, 0, ptr, 0x44, ptr, 0x20)
+            
+            // Check success and return value
+            if iszero(success) {
+                revert(0, 0)
+            }
+            
+            // Some tokens don't return a value, check if return data exists
+            if gt(returndatasize(), 0) {
+                if iszero(mload(ptr)) {
+                    revert(0, 0)
+                }
+            }
+        }
+    }
+    
+    /**
+     * @notice Approve tokens using assembly
+     * @dev Saves gas vs standard approve
+     */
+    function _safeApproveAssembly(address token, address spender, uint256 amount) internal {
+        assembly {
+            // Store function selector for approve(address,uint256)
+            let ptr := mload(0x40)
+            mstore(ptr, 0x095ea7b300000000000000000000000000000000000000000000000000000000)
+            mstore(add(ptr, 0x04), spender)
+            mstore(add(ptr, 0x24), amount)
+            
+            // Call approve
+            let success := call(gas(), token, 0, ptr, 0x44, ptr, 0x20)
+            
+            if iszero(success) {
+                revert(0, 0)
+            }
+            
+            // Check return value if exists
+            if gt(returndatasize(), 0) {
+                if iszero(mload(ptr)) {
+                    revert(0, 0)
+                }
+            }
+        }
     }
 
     // ============================================
@@ -333,9 +457,9 @@ contract FlashBotV3 is IUniswapV3FlashCallback {
     
     function withdrawToken(address token, address to, uint256 amount) external onlyOwner {
         if (to == address(0)) revert ZeroAddress();
-        uint256 balance = IERC20(token).balanceOf(address(this));
+        uint256 balance = _getBalance(token, address(this));
         uint256 withdrawAmount = amount == 0 ? balance : amount;
-        IERC20(token).safeTransfer(to, withdrawAmount);
+        _safeTransferAssembly(token, to, withdrawAmount);
         emit Withdrawn(token, to, withdrawAmount);
     }
     
@@ -353,15 +477,47 @@ contract FlashBotV3 is IUniswapV3FlashCallback {
     // ============================================
     
     function getTokenBalance(address token) external view returns (uint256) {
-        return IERC20(token).balanceOf(address(this));
+        return _getBalance(token, address(this));
     }
     
     function getETHBalance() external view returns (uint256) {
         return address(this).balance;
     }
     
-    function getRouterAllowance(address token) external view returns (uint256) {
-        return IERC20(token).allowance(address(this), SWAP_ROUTER);
+    function getRouterAllowance(address token) external view returns (uint256 allowance_) {
+        assembly {
+            // Store function selector for allowance(address,address)
+            let ptr := mload(0x40)
+            mstore(ptr, 0xdd62ed3e00000000000000000000000000000000000000000000000000000000)
+            mstore(add(ptr, 0x04), address())
+            mstore(add(ptr, 0x24), 0x2626664c2603336E57B271c5C0b26F421741e481) // SWAP_ROUTER
+            
+            let success := staticcall(gas(), token, ptr, 0x44, ptr, 0x20)
+            if iszero(success) { revert(0, 0) }
+            
+            allowance_ := mload(ptr)
+        }
+    }
+    
+    /**
+     * @notice Withdraw all profits (WETH + ETH) to owner
+     * @dev Convenience function for quick profit extraction
+     */
+    function withdrawAll() external onlyOwner {
+        // Withdraw WETH
+        uint256 wethBalance = _getBalance(WETH, address(this));
+        if (wethBalance > 0) {
+            _safeTransferAssembly(WETH, owner, wethBalance);
+            emit Withdrawn(WETH, owner, wethBalance);
+        }
+        
+        // Withdraw ETH
+        uint256 ethBalance = address(this).balance;
+        if (ethBalance > 0) {
+            (bool success,) = owner.call{value: ethBalance}("");
+            if (!success) revert TransferFailed();
+            emit Withdrawn(address(0), owner, ethBalance);
+        }
     }
 }
 

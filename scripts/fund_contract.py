@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-FlashBot 合约注资脚本
+FlashBot 合约注资脚本 (Smart Version)
 
-用于向机器人合约注入 WETH 以支付闪电贷手续费：
-1. 将 ETH 包装成 WETH
-2. 将 WETH 转移到机器人合约
+智能注资逻辑：
+1. 检查钱包现有的 WETH 余额
+2. 如果有足够的 WETH，直接转移到合约（无需包装）
+3. 如果 WETH 不足，先包装 ETH 再转移
 
-⚠️ 此脚本会消耗真实 ETH，请谨慎使用
+⚠️ 此脚本会消耗真实资金，请仔细确认地址
 """
 
 import os
@@ -23,17 +24,18 @@ load_dotenv()
 
 
 # ============================================================
-# 常量配置
+# 从环境变量加载配置（不再硬编码）
 # ============================================================
 
-# 机器人合约地址 (已部署)
-BOT_CONTRACT_ADDRESS = "0xA4099ADD722ca77c958220171FAa6C9C07674596"
-
 # WETH 合约地址 (Base Mainnet)
-WETH_ADDRESS = "0x4200000000000000000000000000000000000006"
+WETH_ADDRESS = os.getenv("WETH", "0x4200000000000000000000000000000000000006")
 
-# 注资金额 (ETH)
-FUND_AMOUNT_ETH = 0.002
+# 默认注资金额 (ETH) - 可通过环境变量覆盖
+DEFAULT_FUND_AMOUNT_ETH = float(os.getenv("FUND_AMOUNT_ETH", "0.002"))
+
+# 最小 WETH 阈值 - 超过此值时询问是否直接转移
+MIN_WETH_THRESHOLD_ETH = float(os.getenv("MIN_WETH_THRESHOLD_ETH", "0.002"))
+
 
 # WETH ABI (仅需要 deposit, transfer, balanceOf)
 WETH_ABI = [
@@ -74,6 +76,18 @@ WETH_ABI = [
 # 辅助函数
 # ============================================================
 
+def get_raw_transaction(signed_tx):
+    """
+    兼容 Web3.py 不同版本的 rawTransaction 获取方式
+    """
+    if hasattr(signed_tx, 'raw_transaction'):
+        return signed_tx.raw_transaction
+    elif hasattr(signed_tx, 'rawTransaction'):
+        return signed_tx.rawTransaction
+    else:
+        raise AttributeError("无法获取 raw transaction，请检查 Web3.py 版本")
+
+
 def connect_web3() -> tuple[Web3, Account]:
     """
     连接到 Web3 网络
@@ -113,105 +127,34 @@ def connect_web3() -> tuple[Web3, Account]:
 def get_balances(w3: Web3, weth_contract, user_address: str, bot_address: str) -> dict:
     """
     获取用户和机器人的余额
-    
-    参数:
-        w3: Web3 实例
-        weth_contract: WETH 合约实例
-        user_address: 用户地址
-        bot_address: 机器人地址
-    
-    返回:
-        余额字典
     """
     user_eth = w3.eth.get_balance(user_address)
     user_weth = weth_contract.functions.balanceOf(user_address).call()
     bot_weth = weth_contract.functions.balanceOf(bot_address).call()
+    bot_eth = w3.eth.get_balance(bot_address)
     
     return {
         "user_eth": user_eth,
         "user_weth": user_weth,
-        "bot_weth": bot_weth
+        "bot_weth": bot_weth,
+        "bot_eth": bot_eth
     }
 
 
 def print_balances(w3: Web3, balances: dict, label: str):
     """
     打印余额信息
-    
-    参数:
-        w3: Web3 实例
-        balances: 余额字典
-        label: 标签 (如 "操作前" / "操作后")
     """
     print(f"\n📊 余额 ({label}):")
-    print(f"   👤 用户 ETH:  {w3.from_wei(balances['user_eth'], 'ether'):.6f} ETH")
-    print(f"   👤 用户 WETH: {w3.from_wei(balances['user_weth'], 'ether'):.6f} WETH")
-    print(f"   🤖 机器人 WETH: {w3.from_wei(balances['bot_weth'], 'ether'):.6f} WETH")
-
-
-def wait_for_weth_balance(
-    w3: Web3,
-    weth_contract,
-    user_address: str,
-    required_amount: int,
-    timeout: int = 30,
-    check_interval: int = 2
-) -> bool:
-    """
-    等待用户的 WETH 余额达到要求的金额
-    
-    用于解决 RPC 延迟问题：deposit 交易确认后，节点可能还未更新余额
-    
-    参数:
-        w3: Web3 实例
-        weth_contract: WETH 合约实例
-        user_address: 用户地址
-        required_amount: 需要的最小余额 (wei)
-        timeout: 超时时间 (秒)
-        check_interval: 检查间隔 (秒)
-    
-    返回:
-        是否在超时前达到要求的余额
-    """
-    print(f"\n⏳ 等待 WETH 余额更新...")
-    print(f"   需要: {w3.from_wei(required_amount, 'ether'):.6f} WETH")
-    print(f"   超时: {timeout} 秒")
-    
-    start_time = time.time()
-    check_count = 0
-    
-    while True:
-        check_count += 1
-        current_balance = weth_contract.functions.balanceOf(user_address).call()
-        elapsed = time.time() - start_time
-        
-        print(f"   [{check_count}] 当前余额: {w3.from_wei(current_balance, 'ether'):.6f} WETH (已等待 {elapsed:.1f}s)")
-        
-        if current_balance >= required_amount:
-            print(f"   ✅ 余额已确认!")
-            return True
-        
-        if elapsed >= timeout:
-            print(f"   ❌ 超时! 余额未更新")
-            return False
-        
-        time.sleep(check_interval)
-    
-    return False
+    print(f"   👤 钱包 ETH:    {w3.from_wei(balances['user_eth'], 'ether'):.6f} ETH")
+    print(f"   👤 钱包 WETH:   {w3.from_wei(balances['user_weth'], 'ether'):.6f} WETH")
+    print(f"   🤖 合约 WETH:   {w3.from_wei(balances['bot_weth'], 'ether'):.6f} WETH")
+    print(f"   🤖 合约 ETH:    {w3.from_wei(balances['bot_eth'], 'ether'):.6f} ETH")
 
 
 def wrap_eth(w3: Web3, account: Account, weth_contract, amount_wei: int) -> bool:
     """
     将 ETH 包装成 WETH
-    
-    参数:
-        w3: Web3 实例
-        account: 账户
-        weth_contract: WETH 合约实例
-        amount_wei: 金额 (wei)
-    
-    返回:
-        是否成功
     """
     print(f"\n💱 包装 ETH -> WETH...")
     print(f"   金额: {w3.from_wei(amount_wei, 'ether')} ETH")
@@ -243,7 +186,8 @@ def wrap_eth(w3: Web3, account: Account, weth_contract, amount_wei: int) -> bool
         
         # 签名并发送
         signed_tx = account.sign_transaction(tx)
-        tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+        raw_tx = get_raw_transaction(signed_tx)
+        tx_hash = w3.eth.send_raw_transaction(raw_tx)
         
         print(f"   交易哈希: {tx_hash.hex()}")
         print(f"   等待确认...")
@@ -273,20 +217,10 @@ def transfer_weth(
 ) -> bool:
     """
     转移 WETH 到目标地址
-    
-    参数:
-        w3: Web3 实例
-        account: 账户
-        weth_contract: WETH 合约实例
-        to_address: 目标地址
-        amount_wei: 金额 (wei)
-    
-    返回:
-        是否成功
     """
     to_address = w3.to_checksum_address(to_address)
     
-    print(f"\n📤 转移 WETH 到机器人...")
+    print(f"\n📤 转移 WETH 到合约...")
     print(f"   目标: {to_address}")
     print(f"   金额: {w3.from_wei(amount_wei, 'ether')} WETH")
     
@@ -319,7 +253,8 @@ def transfer_weth(
         
         # 签名并发送
         signed_tx = account.sign_transaction(tx)
-        tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+        raw_tx = get_raw_transaction(signed_tx)
+        tx_hash = w3.eth.send_raw_transaction(raw_tx)
         
         print(f"   交易哈希: {tx_hash.hex()}")
         print(f"   等待确认...")
@@ -340,6 +275,78 @@ def transfer_weth(
         return False
 
 
+def wait_for_weth_balance(
+    w3: Web3,
+    weth_contract,
+    user_address: str,
+    required_amount: int,
+    timeout: int = 30,
+    check_interval: int = 2
+) -> bool:
+    """
+    等待用户的 WETH 余额达到要求的金额
+    """
+    print(f"\n⏳ 等待 WETH 余额更新...")
+    print(f"   需要: {w3.from_wei(required_amount, 'ether'):.6f} WETH")
+    print(f"   超时: {timeout} 秒")
+    
+    start_time = time.time()
+    check_count = 0
+    
+    while True:
+        check_count += 1
+        current_balance = weth_contract.functions.balanceOf(user_address).call()
+        elapsed = time.time() - start_time
+        
+        print(f"   [{check_count}] 当前余额: {w3.from_wei(current_balance, 'ether'):.6f} WETH (已等待 {elapsed:.1f}s)")
+        
+        if current_balance >= required_amount:
+            print(f"   ✅ 余额已确认!")
+            return True
+        
+        if elapsed >= timeout:
+            print(f"   ❌ 超时! 余额未更新")
+            return False
+        
+        time.sleep(check_interval)
+    
+    return False
+
+
+def ask_user_choice(prompt: str, default: str = "n") -> bool:
+    """
+    询问用户确认
+    """
+    try:
+        response = input(f"{prompt} [{default.upper() if default == 'y' else 'y'}/{default.upper() if default == 'n' else 'n'}]: ").strip().lower()
+        if not response:
+            response = default
+        return response == 'y' or response == 'yes'
+    except (EOFError, KeyboardInterrupt):
+        return False
+
+
+def ask_amount(prompt: str, default: float, max_amount: float) -> float:
+    """
+    询问用户输入金额
+    """
+    try:
+        response = input(f"{prompt} (默认: {default}, 最大: {max_amount:.6f}): ").strip()
+        if not response:
+            return default
+        
+        amount = float(response)
+        if amount <= 0:
+            print("   ⚠️ 金额必须大于 0，使用默认值")
+            return default
+        if amount > max_amount:
+            print(f"   ⚠️ 金额超过最大值，使用 {max_amount:.6f}")
+            return max_amount
+        return amount
+    except (ValueError, EOFError, KeyboardInterrupt):
+        return default
+
+
 # ============================================================
 # 主函数
 # ============================================================
@@ -347,76 +354,179 @@ def transfer_weth(
 def main():
     """主函数"""
     print("=" * 60)
-    print("💰 FlashBot 合约注资脚本")
+    print("💰 FlashBot 合约注资脚本 (Smart Version)")
     print("=" * 60)
     
-    amount_wei = Web3.to_wei(FUND_AMOUNT_ETH, 'ether')
+    # ===== 1. 从 .env 加载配置 =====
+    flashbot_address = os.getenv("FLASHBOT_ADDRESS")
+    if not flashbot_address:
+        print("\n❌ 错误: 请在 .env 中设置 FLASHBOT_ADDRESS")
+        print("   这是你的 V3 机器人合约地址")
+        sys.exit(1)
     
-    print(f"\n📋 配置:")
-    print(f"   机器人地址: {BOT_CONTRACT_ADDRESS}")
+    print(f"\n📋 配置 (从 .env 加载):")
+    print(f"   合约地址 (FLASHBOT_ADDRESS): {flashbot_address}")
     print(f"   WETH 合约: {WETH_ADDRESS}")
-    print(f"   注资金额: {FUND_AMOUNT_ETH} ETH")
+    print(f"   默认注资金额: {DEFAULT_FUND_AMOUNT_ETH} ETH")
+    print(f"   WETH 阈值: {MIN_WETH_THRESHOLD_ETH} ETH")
     
-    # ===== 1. 连接网络 =====
+    # ===== 2. 连接网络 =====
     print()
     w3, account = connect_web3()
     
-    print(f"\n👛 账户:")
-    print(f"   地址: {account.address}")
+    # 安全检查 - 显示关键地址
+    print("\n" + "=" * 60)
+    print("⚠️  安全检查 - 请确认以下地址正确")
+    print("=" * 60)
+    print(f"   👤 你的钱包:      {account.address}")
+    print(f"   🤖 目标合约:      {flashbot_address}")
+    print("=" * 60)
     
-    # ===== 2. 初始化合约 =====
+    # ===== 3. 初始化合约 =====
     weth_address = w3.to_checksum_address(WETH_ADDRESS)
-    bot_address = w3.to_checksum_address(BOT_CONTRACT_ADDRESS)
+    bot_address = w3.to_checksum_address(flashbot_address)
     weth_contract = w3.eth.contract(address=weth_address, abi=WETH_ABI)
     
-    # ===== 3. 显示操作前余额 =====
-    balances_before = get_balances(w3, weth_contract, account.address, bot_address)
-    print_balances(w3, balances_before, "操作前")
+    # ===== 4. 显示当前余额 =====
+    balances = get_balances(w3, weth_contract, account.address, bot_address)
+    print_balances(w3, balances, "当前")
     
-    # 检查余额是否足够
-    if balances_before["user_eth"] < amount_wei:
-        print(f"\n❌ ETH 余额不足!")
-        print(f"   需要: {w3.from_wei(amount_wei, 'ether')} ETH")
-        print(f"   当前: {w3.from_wei(balances_before['user_eth'], 'ether')} ETH")
-        sys.exit(1)
+    user_weth = balances["user_weth"]
+    user_eth = balances["user_eth"]
+    user_weth_eth = float(w3.from_wei(user_weth, 'ether'))
+    user_eth_eth = float(w3.from_wei(user_eth, 'ether'))
     
-    # ===== 4. 包装 ETH -> WETH =====
-    if not wrap_eth(w3, account, weth_contract, amount_wei):
+    # ===== 5. 智能逻辑：检查钱包 WETH 余额 =====
+    threshold_wei = Web3.to_wei(MIN_WETH_THRESHOLD_ETH, 'ether')
+    
+    if user_weth >= threshold_wei:
+        # 钱包有足够的 WETH
+        print(f"\n💡 检测到钱包有 {user_weth_eth:.6f} WETH (>= {MIN_WETH_THRESHOLD_ETH} 阈值)")
+        print(f"   可以直接转移现有 WETH，无需包装 ETH")
+        
+        if ask_user_choice("\n是否转移现有 WETH 到合约?", "y"):
+            # 询问转移金额
+            transfer_amount_eth = ask_amount(
+                "   输入转移金额 (ETH)", 
+                min(user_weth_eth, DEFAULT_FUND_AMOUNT_ETH),
+                user_weth_eth
+            )
+            transfer_amount_wei = Web3.to_wei(transfer_amount_eth, 'ether')
+            
+            print(f"\n📝 即将转移 {transfer_amount_eth:.6f} WETH 到 {bot_address[:20]}...")
+            
+            if ask_user_choice("确认执行?", "y"):
+                if transfer_weth(w3, account, weth_contract, bot_address, transfer_amount_wei):
+                    # 成功 - 显示结果
+                    balances_after = get_balances(w3, weth_contract, account.address, bot_address)
+                    print_balances(w3, balances_after, "操作后")
+                    
+                    weth_change = balances_after["bot_weth"] - balances["bot_weth"]
+                    print(f"\n📈 合约 WETH: +{w3.from_wei(weth_change, 'ether'):.6f} WETH")
+                    
+                    print("\n" + "=" * 60)
+                    print("🎉 注资完成!")
+                    print("=" * 60)
+                    print(f"\n📋 摘要:")
+                    print(f"   合约现有 WETH: {w3.from_wei(balances_after['bot_weth'], 'ether'):.6f} WETH")
+                    print(f"\n📝 下一步:")
+                    print(f"   运行主程序: python main.py")
+                else:
+                    print("\n❌ 转移失败")
+                    sys.exit(1)
+            else:
+                print("\n⚠️ 用户取消操作")
+                sys.exit(0)
+        else:
+            print("\n⚠️ 用户选择不转移")
+            # 询问是否使用包装流程
+            if ask_user_choice("是否使用 ETH 包装流程?", "n"):
+                _do_wrap_and_transfer(w3, account, weth_contract, bot_address, balances)
+            else:
+                sys.exit(0)
+    
+    else:
+        # 钱包 WETH 不足，使用包装流程
+        print(f"\n💡 钱包 WETH ({user_weth_eth:.6f}) 低于阈值 ({MIN_WETH_THRESHOLD_ETH})")
+        print(f"   将使用 ETH 包装流程")
+        
+        if user_eth < Web3.to_wei(DEFAULT_FUND_AMOUNT_ETH, 'ether'):
+            print(f"\n⚠️ ETH 余额也不足 ({user_eth_eth:.6f} < {DEFAULT_FUND_AMOUNT_ETH})")
+            
+            if user_weth > 0:
+                print(f"   但是你有 {user_weth_eth:.6f} WETH，可以转移这些")
+                if ask_user_choice("是否转移现有 WETH?", "y"):
+                    transfer_amount_wei = user_weth  # 全部转移
+                    if transfer_weth(w3, account, weth_contract, bot_address, transfer_amount_wei):
+                        balances_after = get_balances(w3, weth_contract, account.address, bot_address)
+                        print_balances(w3, balances_after, "操作后")
+                        print("\n🎉 注资完成!")
+                    else:
+                        print("\n❌ 转移失败")
+                        sys.exit(1)
+            else:
+                print("\n❌ 余额不足，无法继续")
+                sys.exit(1)
+        else:
+            _do_wrap_and_transfer(w3, account, weth_contract, bot_address, balances)
+    
+    print()
+
+
+def _do_wrap_and_transfer(w3, account, weth_contract, bot_address, balances):
+    """执行包装 + 转移流程"""
+    user_eth_eth = float(w3.from_wei(balances["user_eth"], 'ether'))
+    
+    # 询问包装金额
+    wrap_amount_eth = ask_amount(
+        "\n   输入包装金额 (ETH)",
+        DEFAULT_FUND_AMOUNT_ETH,
+        user_eth_eth - 0.001  # 保留一些 gas
+    )
+    wrap_amount_wei = Web3.to_wei(wrap_amount_eth, 'ether')
+    
+    print(f"\n📝 即将:")
+    print(f"   1. 包装 {wrap_amount_eth:.6f} ETH -> WETH")
+    print(f"   2. 转移 {wrap_amount_eth:.6f} WETH 到 {bot_address[:20]}...")
+    
+    if not ask_user_choice("确认执行?", "y"):
+        print("\n⚠️ 用户取消操作")
+        sys.exit(0)
+    
+    # 包装 ETH
+    if not wrap_eth(w3, account, weth_contract, wrap_amount_wei):
         print("\n❌ 包装失败，操作中止")
         sys.exit(1)
     
-    # ===== 4.5 等待余额更新 (解决 RPC 延迟问题) =====
-    if not wait_for_weth_balance(w3, weth_contract, account.address, amount_wei):
+    # 等待余额更新
+    if not wait_for_weth_balance(w3, weth_contract, account.address, wrap_amount_wei):
         print("\n❌ WETH 余额未更新，操作中止")
         print("⚠️ 注意: WETH 可能已在你的钱包中，请稍后手动检查并转移")
         sys.exit(1)
     
-    # ===== 5. 转移 WETH 到机器人 =====
-    if not transfer_weth(w3, account, weth_contract, bot_address, amount_wei):
+    # 转移 WETH
+    if not transfer_weth(w3, account, weth_contract, bot_address, wrap_amount_wei):
         print("\n❌ 转移失败，操作中止")
         print("⚠️ 注意: WETH 仍在你的钱包中，可以稍后手动转移")
         sys.exit(1)
     
-    # ===== 6. 显示操作后余额 =====
+    # 显示结果
     balances_after = get_balances(w3, weth_contract, account.address, bot_address)
     print_balances(w3, balances_after, "操作后")
     
-    # ===== 7. 显示变化 =====
+    eth_change = balances_after["user_eth"] - balances["user_eth"]
+    weth_change = balances_after["bot_weth"] - balances["bot_weth"]
     print(f"\n📈 余额变化:")
-    eth_change = balances_after["user_eth"] - balances_before["user_eth"]
-    weth_change = balances_after["bot_weth"] - balances_before["bot_weth"]
     print(f"   用户 ETH: {w3.from_wei(eth_change, 'ether'):+.6f} ETH (包含 gas 费)")
-    print(f"   机器人 WETH: {w3.from_wei(weth_change, 'ether'):+.6f} WETH")
+    print(f"   合约 WETH: {w3.from_wei(weth_change, 'ether'):+.6f} WETH")
     
-    # ===== 完成 =====
     print("\n" + "=" * 60)
     print("🎉 注资完成!")
     print("=" * 60)
     print(f"\n📋 摘要:")
-    print(f"   机器人现有 WETH: {w3.from_wei(balances_after['bot_weth'], 'ether'):.6f} WETH")
+    print(f"   合约现有 WETH: {w3.from_wei(balances_after['bot_weth'], 'ether'):.6f} WETH")
     print(f"\n📝 下一步:")
     print(f"   运行主程序: python main.py")
-    print()
 
 
 if __name__ == "__main__":
@@ -430,4 +540,3 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
         sys.exit(1)
-

@@ -54,6 +54,7 @@ typing-extensions>=4.0.0
 # JSON & Data Validation
 # --------------------------------------------
 jsonschema>=4.0.0
+orjson>=3.9.0  # Fast JSON parsing (10x faster than stdlib)
 
 # --------------------------------------------
 # AWS Deployment (Optional - for cloud)

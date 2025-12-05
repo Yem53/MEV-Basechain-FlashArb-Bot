@@ -3,6 +3,9 @@ FlashArb-Core 配置加载器
 
 负责加载和验证链配置以及环境变量中的敏感信息。
 将静态JSON配置与环境变量结合，实现安全的凭证管理。
+
+⚡ 高性能优化:
+- 使用 orjson 进行快速 JSON 解析 (10x faster)
 """
 
 import json
@@ -12,6 +15,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
+
+# Try to import orjson for faster JSON parsing
+try:
+    import orjson
+    HAS_ORJSON = True
+except ImportError:
+    HAS_ORJSON = False
 
 
 @dataclass
@@ -133,9 +143,13 @@ class ConfigLoader:
             raise ConfigValidationError(f"配置文件不存在: {path}")
         
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                config = json.load(f)
-        except json.JSONDecodeError as e:
+            if HAS_ORJSON:
+                with open(path, "rb") as f:  # orjson works with bytes
+                    config = orjson.loads(f.read())
+            else:
+                with open(path, "r", encoding="utf-8") as f:
+                    config = json.load(f)
+        except (json.JSONDecodeError, ValueError) as e:
             raise ConfigValidationError(f"{path} 中的 JSON 格式无效: {e}")
         
         # 基本结构验证

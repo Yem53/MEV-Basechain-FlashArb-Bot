@@ -28,8 +28,18 @@ import signal
 from pathlib import Path
 from datetime import datetime
 
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from dotenv import load_dotenv
 from web3 import Web3
+
+# Try to import orjson for faster JSON parsing
+try:
+    import orjson
+    HAS_ORJSON = True
+except ImportError:
+    HAS_ORJSON = False
 
 # Project root
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -59,9 +69,10 @@ MULTICALL3 = os.getenv("MULTICALL3", "0xcA11bde05977b3631167028862bE2a173976CA11
 # Arbitrage settings
 MIN_PROFIT_ETH = float(os.getenv("MIN_PROFIT_ETH", "0.001"))
 MIN_PROFIT_WEI = int(MIN_PROFIT_ETH * 10**18)
-BORROW_AMOUNT_ETH = float(os.getenv("BORROW_AMOUNT_ETH", "1.0"))
-BORROW_AMOUNT = int(BORROW_AMOUNT_ETH * 10**18)
-MAX_BORROW_ETH = float(os.getenv("MAX_BORROW_ETH", "10.0"))
+# Dynamic amount optimization range (no hardcoded borrow amount)
+MIN_BORROW_ETH = float(os.getenv("MIN_BORROW_ETH", "0.01"))
+MAX_BORROW_ETH = float(os.getenv("MAX_BORROW_ETH", "20.0"))
+AMOUNT_PRECISION_ETH = float(os.getenv("AMOUNT_PRECISION_ETH", "0.001"))
 
 # Gas settings
 MAX_GAS_GWEI = float(os.getenv("MAX_GAS_GWEI", "1.0"))
@@ -194,6 +205,11 @@ from core.executor import V3Executor, ExecutionResult
 class FlashArbBot:
     """
     Native Uniswap V3 Arbitrage Bot
+    
+    ⚡ High-Performance Features:
+    - HTTP Keep-Alive with connection pooling
+    - orjson for fast JSON parsing (if available)
+    - EIP-2930 Access Lists for gas optimization
     """
     
     def __init__(self):
@@ -201,6 +217,7 @@ class FlashArbBot:
         self.contract = None
         self.scanner = None
         self.executor = None
+        self._http_session = None  # Persistent HTTP session
         
         # State
         self.running = False
@@ -213,6 +230,52 @@ class FlashArbBot:
         # Signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
+    
+    def _create_persistent_session(self) -> requests.Session:
+        """
+        Create a persistent HTTP session with connection pooling.
+        
+        ⚡ Optimization: Prevents TCP handshake on every request.
+        The connection stays open between scan cycles.
+        """
+        session = requests.Session()
+        
+        # Configure retry strategy
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=0.1,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+        
+        # Create adapter with connection pooling
+        adapter = HTTPAdapter(
+            pool_connections=10,      # Number of connection pools
+            pool_maxsize=20,          # Connections per pool
+            max_retries=retry_strategy,
+            pool_block=False          # Don't block when pool is full
+        )
+        
+        # Mount adapter for both HTTP and HTTPS
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        
+        # Set default headers for keep-alive
+        session.headers.update({
+            "Connection": "keep-alive",
+            "Keep-Alive": "timeout=60, max=1000",
+            "Content-Type": "application/json",
+        })
+        
+        return session
+    
+    def _cleanup_session(self):
+        """Cleanup persistent HTTP session."""
+        if self._http_session:
+            try:
+                self._http_session.close()
+            except:
+                pass
+            self._http_session = None
     
     def _signal_handler(self, signum, frame):
         """Handle shutdown signal."""
@@ -230,9 +293,22 @@ class FlashArbBot:
         print("     🚀 FlashArb V3 - Native Uniswap V3 Arbitrage Bot")
         print("=" * 60)
         
-        # Connect to network
+        # Connect to network with persistent HTTP session (Keep-Alive)
         print(f"\n🌐 Connecting to: {RPC_URL[:50]}...")
-        self.w3 = Web3(Web3.HTTPProvider(RPC_URL, request_kwargs={"timeout": RPC_TIMEOUT}))
+        print(f"   ⚡ Using HTTP Keep-Alive for low latency")
+        
+        # Create persistent session with connection pooling
+        self._http_session = self._create_persistent_session()
+        
+        # Create Web3 provider with the persistent session
+        provider = Web3.HTTPProvider(
+            RPC_URL,
+            request_kwargs={
+                "timeout": RPC_TIMEOUT,
+            },
+            session=self._http_session
+        )
+        self.w3 = Web3(provider)
         
         if not self.w3.is_connected():
             print("❌ Failed to connect")
@@ -290,8 +366,8 @@ class FlashArbBot:
         print("=" * 60)
         print(f"  Chain ID:           {CHAIN_ID}")
         print(f"  Min Profit:         {MIN_PROFIT_ETH} ETH")
-        print(f"  Borrow Amount:      {BORROW_AMOUNT_ETH} ETH")
-        print(f"  Max Borrow:         {MAX_BORROW_ETH} ETH")
+        print(f"  Amount Range:       {MIN_BORROW_ETH} - {MAX_BORROW_ETH} ETH (Dynamic)")
+        print(f"  Precision:          {AMOUNT_PRECISION_ETH} ETH")
         print(f"  Scan Interval:      {SCAN_INTERVAL}s")
         print(f"  Max Gas:            {MAX_GAS_GWEI} gwei")
         print(f"  Gas Limit:          {GAS_LIMIT}")
@@ -305,6 +381,12 @@ class FlashArbBot:
         print(f"  Sniper Mode:        {'✅ On (×' + str(SNIPER_MODE_MULTIPLIER) + ')' if SNIPER_MODE_ENABLED else '❌ Off'}")
         print(f"  Shadow Mode:        {'✅ On (' + str(SHADOW_SPREAD_THRESHOLD*100) + '%)' if SHADOW_MODE_ENABLED else '❌ Off'}")
         print(f"  Latency Profiling:  {'✅ On' if LATENCY_PROFILING else '❌ Off'}")
+        print("=" * 60)
+        print("⚡ Performance Optimizations")
+        print("=" * 60)
+        print(f"  orjson (Fast JSON): {'✅ Enabled' if HAS_ORJSON else '❌ Not installed'}")
+        print(f"  HTTP Keep-Alive:    ✅ Enabled (Connection Pooling)")
+        print(f"  Access Lists:       ✅ Enabled (EIP-2930)")
         print("=" * 60)
         print("📊 Discovery")
         print("=" * 60)
@@ -338,8 +420,11 @@ class FlashArbBot:
             try:
                 cycle_start = time.time()
                 
-                # Scan
-                result = self.scanner.scan()
+                # Scan with dynamic amount optimization
+                result = self.scanner.scan(
+                    min_profit_wei=MIN_PROFIT_WEI,
+                    use_optimization=True
+                )
                 self.scan_count += 1
                 
                 # Handle opportunities
@@ -375,7 +460,15 @@ class FlashArbBot:
             print(f"  Pool Low:      {opp.pool_low.address[:20]}... ({FEE_NAMES[opp.pool_low.fee]})")
             print(f"  Pool High:     {opp.pool_high.address[:20]}... ({FEE_NAMES[opp.pool_high.fee]})")
             print(f"  Price Diff:    {opp.price_diff_pct:.4f}%")
-            print(f"  Gross Profit:  {opp.expected_profit / 10**18:.6f} ETH")
+            # Dynamic amount optimization results
+            opt_label = "✨ OPTIMIZED" if opp.is_optimized else "FIXED"
+            print(f"  Borrow Amount: {opp.borrow_amount / 10**18:.4f} ETH ({opt_label})")
+            if opp.is_optimized and opp.price_impact_pct > 0:
+                print(f"  Price Impact:  {opp.price_impact_pct:.2f}%")
+            if opp.swap1_output > 0:
+                print(f"  Swap1 Output:  {opp.swap1_output / 10**18:.6f}")
+            if opp.swap2_output > 0:
+                print(f"  Swap2 Output:  {opp.swap2_output / 10**18:.6f}")
             print(f"  Flash Fee:     {opp.flash_fee / 10**18:.6f} ETH")
             print(f"  Net Profit:    {opp.net_profit / 10**18:.6f} ETH")
             
@@ -476,6 +569,9 @@ class FlashArbBot:
             print(f"\n  Executor Stats:")
             print(f"    Transactions: {stats['tx_count']}")
             print(f"    Success Rate: {stats['success_rate']*100:.1f}%")
+        
+        # Cleanup persistent HTTP session
+        self._cleanup_session()
         
         print("=" * 60)
         print("👋 Goodbye!")
