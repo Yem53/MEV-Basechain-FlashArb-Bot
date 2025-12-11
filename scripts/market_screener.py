@@ -68,11 +68,11 @@ API_RATE_LIMIT_DELAY = 0.25  # seconds between requests
 API_MAX_RETRIES = 3
 API_RETRY_BACKOFF = 2.0  # multiplier
 
-# Filtering Defaults
-DEFAULT_MIN_LIQUIDITY = 50_000.0   # $50k - V3 needs depth
-DEFAULT_MIN_VOLUME = 10_000.0      # $10k 24h volume
-DEFAULT_MIN_SPREAD = 0.5           # 0.5% minimum spread
-DEFAULT_TOP_N = 10
+# Filtering Defaults (Optimized for Tier 2 opportunities)
+DEFAULT_MIN_LIQUIDITY = 15_000.0   # $15k - Capture smaller, wilder pools
+DEFAULT_MIN_VOLUME = 3_000.0       # $3k 24h volume - Capture newer coins
+DEFAULT_MIN_SPREAD = 0.2           # 0.2% minimum spread - More aggressive
+DEFAULT_TOP_N = 20                 # Output 20 tokens by default
 
 # Honeypot Detection Thresholds
 MAX_FDV_TO_LIQUIDITY_RATIO = 100   # FDV > 100x liquidity is suspicious
@@ -620,6 +620,11 @@ def generate_config_file(tokens: List[TokenAnalysis], output_path: str, top_n: i
     lines.append('')
     lines.append('⚠️ CAUTION: Verify "decimals" on-chain before running with real funds!')
     lines.append('   Use: contract.functions.decimals().call()')
+    lines.append('')
+    lines.append('📊 Liquidity Guide:')
+    lines.append('   - $1M+   = Blue chip, very safe')
+    lines.append('   - $100K+ = Solid liquidity')
+    lines.append('   - $15K+  = Tier 2, higher volatility/opportunity')
     lines.append('"""')
     lines.append('')
     lines.append('TARGET_TOKENS = [')
@@ -628,9 +633,22 @@ def generate_config_file(tokens: List[TokenAnalysis], output_path: str, top_n: i
         # Calculate min_profit based on spread
         min_profit = token.calculate_min_profit()
         
-        # Comment with stats
+        # Determine liquidity tier
+        liq = token.total_liquidity
+        if liq >= 1_000_000:
+            tier = "🔵 Blue Chip"
+        elif liq >= 100_000:
+            tier = "🟢 Solid"
+        elif liq >= 50_000:
+            tier = "🟡 Mid"
+        else:
+            tier = "🟠 Tier 2"
+        
+        # Comment with detailed stats (including raw liquidity USD)
         liq_str = format_usd(token.total_liquidity)
-        lines.append(f'    # {token.symbol} | Spread: {token.spread_pct:.2f}% | Liq: {liq_str} | DEXs: {", ".join(token.dex_list[:3])}')
+        vol_str = format_usd(token.total_volume_24h)
+        lines.append(f'    # {token.symbol} | {tier} | Liq: {liq_str} (${token.total_liquidity:,.0f}) | Vol: {vol_str} | Spread: {token.spread_pct:.2f}%')
+        lines.append(f'    # DEXs: {", ".join(token.dex_list[:3])} | Txns: {token.total_txns_24h}')
         
         # Config dict
         lines.append('    {')
@@ -691,8 +709,20 @@ def print_config_preview(tokens: List[TokenAnalysis], top_n: int) -> None:
     for token in sorted_tokens:
         min_profit = token.calculate_min_profit()
         liq_str = format_usd(token.total_liquidity)
+        vol_str = format_usd(token.total_volume_24h)
         
-        print(f'    # {token.symbol} | Spread: {token.spread_pct:.2f}% | Liq: {liq_str}')
+        # Determine liquidity tier
+        liq = token.total_liquidity
+        if liq >= 1_000_000:
+            tier = "🔵 Blue Chip"
+        elif liq >= 100_000:
+            tier = "🟢 Solid"
+        elif liq >= 50_000:
+            tier = "🟡 Mid"
+        else:
+            tier = "🟠 Tier 2"
+        
+        print(f'    # {token.symbol} | {tier} | Liq: {liq_str} (${token.total_liquidity:,.0f}) | Spread: {token.spread_pct:.2f}%')
         print('    {')
         print(f'        "symbol": "{token.symbol}",')
         print(f'        "address": "{token.address}",')

@@ -30,12 +30,22 @@ except ImportError:
     HAS_ORJSON = False
 
 # Import optimization functions from calculator
-from .calculator import (
-    V3PoolData,
-    V3ArbitrageResult,
-    find_optimal_amount_in_fast,
-    quick_profit_check_fast,
-)
+# Supports both package import (main.py) and direct execution (testing)
+try:
+    from .calculator import (
+        V3PoolData,
+        V3ArbitrageResult,
+        find_optimal_amount_in_fast,
+        quick_profit_check_fast,
+    )
+except ImportError:
+    # Direct execution fallback
+    from calculator import (
+        V3PoolData,
+        V3ArbitrageResult,
+        find_optimal_amount_in_fast,
+        quick_profit_check_fast,
+    )
 
 # ============================================
 # V3 Constants - Load from env or use defaults
@@ -124,13 +134,29 @@ class ArbitrageOpportunity:
 
 
 @dataclass
+class NearMiss:
+    """Near-miss opportunity (spread detected but not profitable)"""
+    symbol: str
+    spread_pct: float
+    gross_profit_wei: int
+    gas_cost_wei: int
+    net_profit_wei: int
+    direction: str
+    reason: str
+
+
+@dataclass
 class ScanResult:
     """Scan cycle result"""
     opportunities: List[ArbitrageOpportunity] = field(default_factory=list)
+    near_misses: List[NearMiss] = field(default_factory=list)
     pools_scanned: int = 0
     pools_active: int = 0
     time_network_ms: float = 0.0
     time_calc_ms: float = 0.0
+    # Best spread tracking for heartbeat
+    best_spread_pct: float = 0.0
+    best_spread_symbol: str = ""
 
 
 # ============================================
@@ -454,17 +480,30 @@ class V3Scanner:
     
     def find_opportunities(
         self,
-        min_profit_wei: int = 0
-    ) -> List[ArbitrageOpportunity]:
+        min_profit_wei: int = 0,
+        near_miss_threshold_pct: float = 0.1  # Log near-misses above 0.1% spread
+    ) -> Tuple[List[ArbitrageOpportunity], List[NearMiss], float, str]:
         """
         Find arbitrage opportunities using local-only calculations.
         
         ⚡ No RPC calls - uses cached pool data.
+        
+        Returns:
+            Tuple of (opportunities, near_misses, best_spread_pct, best_spread_symbol)
         """
         opportunities = []
+        near_misses = []
+        best_spread_pct = 0.0
+        best_spread_symbol = ""
         
         # Group pools by token pair (optimized)
         pair_pools: Dict[Tuple[str, str], List[V3Pool]] = {}
+        token_symbols: Dict[str, str] = {}  # Map token address to symbol
+        
+        # Build symbol lookup from target_tokens
+        for token_config in self.target_tokens:
+            addr = token_config["address"].lower()
+            token_symbols[addr] = token_config.get("symbol", "???")
         
         for pool in self.pool_list:
             if pool.liquidity < self.min_liquidity:
@@ -484,29 +523,43 @@ class V3Scanner:
         
         weth_lower = WETH.lower()
         
-        for pools in pair_pools.values():
+        for (t0, t1), pools in pair_pools.items():
             n = len(pools)
             if n < 2:
                 continue
+            
+            # Get symbol for this pair
+            other_token = t0 if t1 == weth_lower else t1
+            symbol = token_symbols.get(other_token, "???")
             
             for i in range(n):
                 pool_a = pools[i]
                 for j in range(i + 1, n):
                     pool_b = pools[j]
                     
-                    opp = self._check_opportunity_fast(
+                    opp, near_miss, spread_pct = self._check_opportunity_with_near_miss(
                         pool_a, pool_b, min_profit_wei,
-                        min_amount, max_amount, precision, weth_lower
+                        min_amount, max_amount, precision, weth_lower,
+                        near_miss_threshold_pct, symbol
                     )
+                    
+                    # Track best spread
+                    if spread_pct > best_spread_pct:
+                        best_spread_pct = spread_pct
+                        best_spread_symbol = symbol
+                    
                     if opp:
                         opportunities.append(opp)
+                    elif near_miss:
+                        near_misses.append(near_miss)
         
         # Sort by profit (descending)
         opportunities.sort(key=lambda x: x.net_profit, reverse=True)
+        near_misses.sort(key=lambda x: x.spread_pct, reverse=True)
         
-        return opportunities
+        return opportunities, near_misses, best_spread_pct, best_spread_symbol
     
-    def _check_opportunity_fast(
+    def _check_opportunity_with_near_miss(
         self,
         pool_a: V3Pool,
         pool_b: V3Pool,
@@ -514,19 +567,24 @@ class V3Scanner:
         min_amount: int,
         max_amount: int,
         precision: int,
-        weth_lower: str
-    ) -> Optional[ArbitrageOpportunity]:
+        weth_lower: str,
+        near_miss_threshold_pct: float,
+        symbol: str
+    ) -> Tuple[Optional[ArbitrageOpportunity], Optional[NearMiss], float]:
         """
-        Fast opportunity check using local math only.
+        Check for opportunity with near-miss tracking.
         
         ⚡ Zero RPC calls - pure computation.
+        
+        Returns:
+            Tuple of (opportunity, near_miss, spread_pct)
         """
         # Quick price check
         price_a = pool_a.price_0_to_1
         price_b = pool_b.price_0_to_1
         
         if price_a <= 0 or price_b <= 0:
-            return None
+            return None, None, 0.0
         
         # Calculate price difference
         if price_a > price_b:
@@ -536,10 +594,19 @@ class V3Scanner:
             diff_pct = (price_b - price_a) / price_a * 100
             pool_low, pool_high = pool_a, pool_b
         
-        # Quick filter: need at least 2x fees to be profitable
+        direction = f"{FEE_NAMES[pool_low.fee]} → {FEE_NAMES[pool_high.fee]}"
+        
+        # Calculate fees cost
         min_fee_pct = (pool_a.fee + pool_b.fee) / 10000  # Convert to percentage
-        if diff_pct < min_fee_pct * 1.5:
-            return None
+        flash_fee_pct = pool_low.fee / 1000000  # 0.05% for 500 tier
+        total_fee_pct = min_fee_pct + flash_fee_pct
+        
+        # Estimate gas cost in ETH (assume ~300k gas at 0.1 gwei on Base)
+        estimated_gas_cost_wei = 300_000 * 100_000_000  # 0.00003 ETH approx
+        
+        # Quick filter: check if spread is even close
+        if diff_pct < near_miss_threshold_pct:
+            return None, None, diff_pct
         
         # Convert to V3PoolData for calculator
         pool_data_low = V3PoolData(
@@ -577,37 +644,70 @@ class V3Scanner:
             borrow_token_is_token0=borrow_token_is_token0
         )
         
-        if max_profit < min_profit:
-            return None
+        # Calculate gross profit (before gas)
+        gross_profit = max_profit + estimated_gas_cost_wei if max_profit > 0 else 0
+        if result and result.flash_fee > 0:
+            gross_profit = result.amount_out_swap2 - best_amount if result.amount_out_swap2 > best_amount else 0
         
-        direction = f"{FEE_NAMES[pool_low.fee]} → {FEE_NAMES[pool_high.fee]}"
+        # Check if profitable
+        if max_profit >= min_profit:
+            return ArbitrageOpportunity(
+                pool_low=pool_low,
+                pool_high=pool_high,
+                token_borrow=WETH,
+                borrow_amount=best_amount,
+                expected_profit=result.amount_out_swap2 if result else 0,
+                flash_fee=result.flash_fee if result else 0,
+                net_profit=max_profit,
+                price_diff_pct=diff_pct,
+                direction=direction,
+                timestamp=time.time(),
+                is_optimized=True,
+                swap1_output=result.amount_out_swap1 if result else 0,
+                swap2_output=result.amount_out_swap2 if result else 0,
+                price_impact_pct=result.price_impact_pct if result else 0.0
+            ), None, diff_pct
         
-        return ArbitrageOpportunity(
-            pool_low=pool_low,
-            pool_high=pool_high,
-            token_borrow=WETH,
-            borrow_amount=best_amount,
-            expected_profit=result.amount_out_swap2 if result else 0,
-            flash_fee=result.flash_fee if result else 0,
-            net_profit=max_profit,
-            price_diff_pct=diff_pct,
-            direction=direction,
-            timestamp=time.time(),
-            is_optimized=True,
-            swap1_output=result.amount_out_swap1 if result else 0,
-            swap2_output=result.amount_out_swap2 if result else 0,
-            price_impact_pct=result.price_impact_pct if result else 0.0
-        )
+        # Create near-miss if spread is significant but not profitable
+        if diff_pct >= near_miss_threshold_pct:
+            # Determine reason for rejection
+            if total_fee_pct * 100 > diff_pct:
+                reason = "Fees exceed spread"
+            elif max_profit < 0:
+                reason = "Negative after slippage"
+            else:
+                reason = "Below min profit threshold"
+            
+            flash_fee = result.flash_fee if result else 0
+            
+            near_miss = NearMiss(
+                symbol=symbol,
+                spread_pct=diff_pct,
+                gross_profit_wei=gross_profit,
+                gas_cost_wei=estimated_gas_cost_wei,
+                net_profit_wei=max_profit,
+                direction=direction,
+                reason=reason
+            )
+            return None, near_miss, diff_pct
+        
+        return None, None, diff_pct
     
     def scan(
         self,
         min_profit_wei: int = 0,
-        use_optimization: bool = True  # Kept for compatibility
+        use_optimization: bool = True,  # Kept for compatibility
+        near_miss_threshold_pct: float = 0.1  # Log near-misses above 0.1% spread
     ) -> ScanResult:
         """
         Execute one scan cycle.
         
         ⚡ Performance: 1 RPC call + local calculations only.
+        
+        Returns ScanResult with:
+        - opportunities: List of profitable trades
+        - near_misses: List of near-miss opportunities (spread detected but not profitable)
+        - best_spread_pct/symbol: Best spread seen this cycle (for heartbeat)
         """
         # Single network request for ALL pool data
         success, network_ms, updated = self.update_pool_data()
@@ -618,9 +718,12 @@ class V3Scanner:
                 time_network_ms=network_ms
             )
         
-        # Local-only calculations
+        # Local-only calculations with near-miss tracking
         t_calc_start = time.time()
-        opportunities = self.find_opportunities(min_profit_wei)
+        opportunities, near_misses, best_spread_pct, best_spread_symbol = self.find_opportunities(
+            min_profit_wei, 
+            near_miss_threshold_pct
+        )
         calc_ms = (time.time() - t_calc_start) * 1000
         
         # Count active pools
@@ -637,10 +740,13 @@ class V3Scanner:
         
         return ScanResult(
             opportunities=opportunities,
+            near_misses=near_misses,
             pools_scanned=len(self.pool_list),
             pools_active=active,
             time_network_ms=network_ms,
-            time_calc_ms=calc_ms
+            time_calc_ms=calc_ms,
+            best_spread_pct=best_spread_pct,
+            best_spread_symbol=best_spread_symbol
         )
     
     def get_pool_prices(self) -> Dict[str, Dict]:

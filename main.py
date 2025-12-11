@@ -21,6 +21,10 @@ Usage:
     python main.py
 """
 
+# Suppress pkg_resources deprecation warning from web3
+import warnings
+warnings.filterwarnings("ignore", message="pkg_resources is deprecated")
+
 import os
 import sys
 import time
@@ -227,7 +231,7 @@ FLASHBOT_ABI = [
 # Import Core Modules
 # ============================================
 
-from core.scanner import V3Scanner, ScanResult, ArbitrageOpportunity, FEE_NAMES
+from core.scanner import V3Scanner, ScanResult, ArbitrageOpportunity, NearMiss, FEE_NAMES
 from core.executor import V3Executor, ExecutionResult
 
 
@@ -447,16 +451,22 @@ class FlashArbBot:
         self.running = True
         self.start_time = time.time()
         
-        print(f"\n🏃 Starting scan loop... (Ctrl+C to stop)\n")
+        # Near-miss logging configuration
+        NEAR_MISS_THRESHOLD_PCT = 0.1  # Log spreads above 0.1%
+        MAX_NEAR_MISSES_PER_CYCLE = 3  # Don't spam logs
+        
+        print(f"\n🏃 Starting scan loop... (Ctrl+C to stop)")
+        print(f"   📊 Near-Miss logging enabled (threshold: {NEAR_MISS_THRESHOLD_PCT}%)\n")
         
         while self.running:
             try:
                 cycle_start = time.time()
                 
-                # Scan with dynamic amount optimization
+                # Scan with dynamic amount optimization and near-miss tracking
                 result = self.scanner.scan(
                     min_profit_wei=MIN_PROFIT_WEI,
-                    use_optimization=True
+                    use_optimization=True,
+                    near_miss_threshold_pct=NEAR_MISS_THRESHOLD_PCT
                 )
                 self.scan_count += 1
                 
@@ -464,7 +474,11 @@ class FlashArbBot:
                 if result.opportunities:
                     self._handle_opportunities(result.opportunities)
                 
-                # Display status
+                # Log near-misses (prove the math is working)
+                if result.near_misses:
+                    self._log_near_misses(result.near_misses[:MAX_NEAR_MISSES_PER_CYCLE])
+                
+                # Display status with best spread
                 self._display_status(result)
                 
                 # Wait for next cycle
@@ -567,18 +581,40 @@ class FlashArbBot:
         except Exception as e:
             return ExecutionResult(success=False, error=str(e))
     
+    def _log_near_misses(self, near_misses: list):
+        """
+        Log near-miss opportunities to prove the math is working.
+        
+        Shows opportunities where spread was detected but profit was insufficient.
+        """
+        for nm in near_misses:
+            gross_eth = nm.gross_profit_wei / 10**18
+            gas_eth = nm.gas_cost_wei / 10**18
+            net_eth = nm.net_profit_wei / 10**18
+            
+            print(f"\n⚠️  [NEAR MISS] {nm.symbol}: "
+                  f"Spread {nm.spread_pct:.2f}% | "
+                  f"Gross: {gross_eth:.6f} ETH | "
+                  f"Gas: ~{gas_eth:.6f} ETH | "
+                  f"Net: {net_eth:.6f} ETH ({nm.reason})")
+    
     def _display_status(self, result: ScanResult):
-        """Display scan status."""
+        """Display scan status with best spread."""
         status = "🟢" if result.pools_active > 0 else "🔴"
         opp = "🎯" if result.opportunities else "⏳"
+        
+        # Best spread info
+        spread_info = ""
+        if result.best_spread_pct > 0:
+            spread_info = f" | Best: {result.best_spread_pct:.2f}% ({result.best_spread_symbol})"
         
         latency = ""
         if LATENCY_PROFILING:
             latency = f" | Net: {result.time_network_ms:.0f}ms | Calc: {result.time_calc_ms:.0f}ms"
         
         print(f"\r{status} Scan #{self.scan_count} | "
-              f"Pools: {result.pools_active}/{result.pools_scanned} | "
-              f"Opportunities: {len(result.opportunities)} {opp}"
+              f"Pools: {result.pools_active}/{result.pools_scanned}{spread_info} | "
+              f"Opps: {len(result.opportunities)} {opp}"
               f"{latency}", end="", flush=True)
     
     def _display_final_stats(self):
